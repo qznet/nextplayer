@@ -32,7 +32,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build release APK (signed with debug key, no secret needed)
-        run: ./gradlew assembleReleaseWithDebugSigning --stacktrace
+        run: ./gradlew assembleRelease-with-debug-signing --stacktrace
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
