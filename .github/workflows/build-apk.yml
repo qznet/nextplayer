@@ -31,12 +31,12 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
+      - name: Build release APK (signed with debug key, no secret needed)
+        run: ./gradlew assembleReleaseWithDebugSigning --stacktrace
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: nextplayer-apks
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/releaseWithDebugSigning/*.apk
           if-no-files-found: error
