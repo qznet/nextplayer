@@ -1,10 +1,12 @@
-name: Build NextPlayer APK (sync upstream)
+name: Build NextPlayer APK (auto sync upstream)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+  schedule:
+    - cron: "0 18 * * *"   # UTC 18:00 = 北京时间 02:00 每日
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -16,11 +18,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync upstream
+      - name: Sync upstream and push to fork
         run: |
           git remote add upstream https://github.com/AnilBeesetti/nextplayer.git || git remote set-url upstream https://github.com/AnilBeesetti/nextplayer.git
           git fetch upstream main
-          git merge upstream/main --no-edit || echo "Already up to date with upstream"
+          git merge upstream/main --no-edit || true
+          git push origin main || true
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -34,9 +37,22 @@ jobs:
       - name: Build release APK (signed with debug key, no secret needed)
         run: ./gradlew assembleRelease-with-debug-signing --stacktrace
 
-      - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: nextplayer-apks
-          path: app/build/outputs/apk/release-with-debug-signing/*.apk
-          if-no-files-found: error
+      - name: Publish / update latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+          NOTES=$(cat <<'EOF'
+          自动同步上游 AnilBeesetti/nextplayer 最新代码，叠加本 fork 两项改造：
+          1. Navigation3 钉回 1.1.5，修复导航栏消失（Nav3 1.1.6 把 contentKey 改为 NavKey 对象导致的回归）
+          2. 全屏播放 DPAD_UP/DOWN 按 0.1 步进调倍速（0.2~4.0）+ Toast 提示
+
+          包名 dev.anilbeesetti.nextplayer.release（debug key 签名）。优先装 arm64-v8a，老 32 位盒子用 universal。
+          上游每次有更新，本 release 会自动重建。
+          EOF
+          )
+          gh release create latest \
+            --title "NextPlayer TV 版（导航修复 + 上下键倍速 · latest）" \
+            --notes "$NOTES" \
+            app/build/outputs/apk/release-with-debug-signing/*.apk
