@@ -1,0 +1,42 @@
+name: Build NextPlayer APK (sync upstream)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream
+        run: |
+          git remote add upstream https://github.com/AnilBeesetti/nextplayer.git || git remote set-url upstream https://github.com/AnilBeesetti/nextplayer.git
+          git fetch upstream main
+          git merge upstream/main --no-edit || echo "Already up to date with upstream"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextplayer-apks
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
