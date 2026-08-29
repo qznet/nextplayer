@@ -40,6 +40,7 @@ jobs:
       - name: Publish / update latest release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: qznet/nextplayer
         run: |
           gh release delete latest --yes || true
           git push origin :refs/tags/latest || true
