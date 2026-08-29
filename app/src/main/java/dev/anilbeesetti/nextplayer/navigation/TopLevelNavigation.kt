@@ -111,7 +111,15 @@ class TopLevelNavState(
      * decide whether a rendered scene should show the nav bar/rail. `contentKey` defaults to the
      * route's `toString()`, matching how the entries are created.
      */
-    val topLevelContentKeys: Set<Any> = destinations.map { it.route.toString() }.toSet()
+    val topLevelContentKeys: Set<String> = destinations.map { it.route.toString() }.toSet()
+
+    /**
+     * Whether [contentKey] belongs to a top-level destination. Navigation3 1.1.6 changed
+     * [androidx.navigation3.runtime.NavEntry.contentKey] from a `route.toString()` string into a
+     * [androidx.navigation3.runtime.NavKey] object, so we normalise via `toString()` to keep matching
+     * the string keys above regardless of the Navigation3 version.
+     */
+    fun isTopLevelContentKey(contentKey: Any?): Boolean = topLevelContentKeys.contains(contentKey.toString())
 
     fun switchTo(route: NavKey) {
         val index = destinations.indexOfFirst { it.route == route }
@@ -144,7 +152,7 @@ class TopLevelNavState(
 }
 
 fun TopLevelNavState.isNavigationBetweenTopLevelDestinations(initialState: Scene<NavKey>, targetState: Scene<NavKey>): Boolean =
-    topLevelContentKeys.run { contains(initialState.entries.lastOrNull()?.contentKey) && contains(targetState.entries.lastOrNull()?.contentKey) }
+    isTopLevelContentKey(initialState.entries.lastOrNull()?.contentKey) && isTopLevelContentKey(targetState.entries.lastOrNull()?.contentKey)
 
 @Composable
 fun NextNavigationBar(state: TopLevelNavState) {
