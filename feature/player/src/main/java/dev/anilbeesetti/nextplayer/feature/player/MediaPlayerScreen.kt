@@ -719,7 +719,7 @@ private fun handlePlayerKeyEvent(
         Key.DirectionUp, Key.DirectionDown -> {
             if (!controls.controlsVisible) {
                 val delta = if (keyEvent.key == Key.DirectionUp) 0.1f else -0.1f
-                val newSpeed = (player.playbackSpeed + delta).coerceIn(0.2f, 4.0f)
+                val newSpeed = (player.playbackParameters.speed + delta).coerceIn(0.2f, 4.0f)
                 player.setPlaybackSpeed(newSpeed)
                 Toast.makeText(context, context.getString(coreUiR.string.fast_playback_speed, newSpeed), Toast.LENGTH_SHORT).show()
                 true
