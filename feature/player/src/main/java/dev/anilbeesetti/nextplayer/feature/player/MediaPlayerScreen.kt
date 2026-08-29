@@ -1,5 +1,6 @@
 package dev.anilbeesetti.nextplayer.feature.player
 
+import android.content.Context
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
@@ -261,6 +262,7 @@ fun MediaPlayerScreen(
                                             seekIncrementMs = seekIncrementMs,
                                             isPlayPauseFocused = isPlayPauseFocused,
                                             onDpadSeek = showDpadSeekFeedback,
+                                            context = context,
                                         )
                                     }
                                 }
@@ -641,6 +643,7 @@ private fun handlePlayerKeyEvent(
     seekIncrementMs: Long,
     isPlayPauseFocused: Boolean,
     onDpadSeek: (deltaMs: Long) -> Unit,
+    context: Context,
 ): Boolean {
     if (keyEvent.key == Key.Back && !controls.controlsLocked) {
         if (!controls.controlsVisible) return false // controls already hidden: let BACK exit
@@ -715,7 +718,10 @@ private fun handlePlayerKeyEvent(
         }
         Key.DirectionUp, Key.DirectionDown -> {
             if (!controls.controlsVisible) {
-                controls.showControls()
+                val delta = if (keyEvent.key == Key.DirectionUp) 0.1f else -0.1f
+                val newSpeed = (player.playbackSpeed + delta).coerceIn(0.2f, 4.0f)
+                player.setPlaybackSpeed(newSpeed)
+                Toast.makeText(context, context.getString(coreUiR.string.fast_playback_speed, newSpeed), Toast.LENGTH_SHORT).show()
                 true
             } else {
                 controls.showControls()
