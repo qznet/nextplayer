@@ -50,6 +50,14 @@ jobs:
       - name: Build release APK (signed with debug key, no secret needed)
         run: ./gradlew assembleRelease-with-debug-signing --stacktrace
 
+      - name: Upload APK artifacts
+        # 无论 release 发布是否成功，构建产物都能从 run 的 artifact 下载。
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextplayer-apks
+          path: app/build/outputs/apk/release-with-debug-signing/*.apk
+          if-no-files-found: error
+
       - name: Publish / update latest release
         # 只有 main 的构建才更新 latest，分支验证构建只留 artifact，避免半成品被当成正式包。
         if: github.ref == 'refs/heads/main'
@@ -59,6 +67,9 @@ jobs:
         run: |
           gh release delete latest --yes || true
           git push origin :refs/tags/latest || true
+          # checkout 带 fetch-depth: 0，本地可能还留着 latest 标签；
+          # 不删掉的话 gh release create 会报 "tag latest exists locally but has not been pushed"。
+          git tag -d latest || true
           NOTES=$(cat <<'EOF'
           自动同步上游 AnilBeesetti/nextplayer 最新代码，叠加本 fork 的改造：
           1. 全屏播放 DPAD_UP/DOWN 按 0.1 步进调倍速（0.2~4.0）+ Toast 提示
@@ -69,6 +80,7 @@ jobs:
           EOF
           )
           gh release create latest \
+            --target main \
             --title "NextPlayer TV 版（上下键倍速 + 非1倍速转2声道PCM · latest）" \
             --notes "$NOTES" \
             app/build/outputs/apk/release-with-debug-signing/*.apk
