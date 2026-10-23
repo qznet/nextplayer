@@ -6,6 +6,8 @@ import android.content.Intent
 import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
@@ -14,6 +16,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Player.DISCONTINUITY_REASON_AUTO_TRANSITION
 import androidx.media3.common.Player.DISCONTINUITY_REASON_REMOVE
@@ -73,10 +76,10 @@ import dev.anilbeesetti.nextplayer.feature.player.extensions.videoDecoderMode
 import dev.anilbeesetti.nextplayer.feature.player.extensions.videoZoom
 import dev.anilbeesetti.nextplayer.feature.player.extensions.withExternalAudio
 import dev.anilbeesetti.nextplayer.feature.player.model.DecoderTrackType
+import dev.anilbeesetti.nextplayer.feature.player.service.audio.SpeedAwareRenderersFactory
 import dev.anilbeesetti.nextplayer.feature.player.utils.isExplicitPlaylistItem
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderManager
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderMode
-import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleDelayMilliseconds
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleSpeed
 import io.github.anilbeesetti.nextlib.mediainfo.MediaInfoBuilder
@@ -124,6 +127,8 @@ class PlayerService : MediaSessionService() {
 
     private lateinit var decoderManager: DecoderManager
     private lateinit var trackSelector: DefaultTrackSelector
+    private var speedAudioFactory: SpeedAwareRenderersFactory? = null
+    private val reselectHandler = Handler(Looper.getMainLooper())
     private val decoderRecoveryManager = DecoderRecoveryManager()
 
     private val decoderAnalyticsListener = object : AnalyticsListener {
@@ -202,6 +207,11 @@ class PlayerService : MediaSessionService() {
     }
 
     private val playbackStateListener = object : Player.Listener {
+        override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
+            super.onPlaybackParametersChanged(playbackParameters)
+            updateSpeedAudioMode(playbackParameters.speed)
+        }
+
         override fun onTimelineChanged(timeline: Timeline, reason: Int) {
             val player = mediaSession?.player as? ExoPlayer ?: return
             // Autoplay controls the implicit folder queue; explicitly chosen playlists play in full.
@@ -692,10 +702,45 @@ class PlayerService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
+    /**
+     * 播放速度跨过 1 倍时切换音频管线：非 1 倍速关闭直通、解码成 PCM 并下混 2 声道。
+     *
+     * 光改闸门不够。media3 不会因为变速重新决策"直通还是解码"——
+     * `MediaCodecAudioRenderer.setPlaybackParameters` 只是把参数转发给 `AudioSink`
+     * （已用 1.11.1 字节码确认），渲染器不会重建解码器。所以这里临时把音轨类型禁用再恢复：
+     * 禁用会让音频渲染器释放解码器，恢复时重新选轨，`shouldUseBypass` 会按新的闸门重算。
+     *
+     * 中间隔 [AUDIO_RESELECT_GAP_MS]，确保两次参数变更落在播放线程的不同轮次，
+     * 否则两次更新可能被合并成一次、根本不会触发重选。
+     */
+    private fun updateSpeedAudioMode(speed: Float) {
+        val factory = speedAudioFactory ?: return
+        val forcePcm = speed != 1f
+        if (factory.speedPcmMode.forcePcm == forcePcm) return
+        factory.speedPcmMode.forcePcm = forcePcm
+
+        val player = mediaSession?.player as? ExoPlayer ?: return
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+            .build()
+        reselectHandler.removeCallbacks(restoreAudioTrackType)
+        reselectHandler.postDelayed(restoreAudioTrackType, AUDIO_RESELECT_GAP_MS)
+    }
+
+    private val restoreAudioTrackType = Runnable {
+        val player = mediaSession?.player as? ExoPlayer ?: return@Runnable
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+            .build()
+    }
+
     override fun onCreate() {
         super.onCreate()
         decoderManager = DecoderManager()
-        val renderersFactory = NextRenderersFactory(applicationContext).setDecoderManager(decoderManager)
+        val renderersFactory = SpeedAwareRenderersFactory(applicationContext).apply {
+            setDecoderManager(decoderManager)
+        }
+        speedAudioFactory = renderersFactory
 
         trackSelector = DefaultTrackSelector(applicationContext).apply {
             setParameters(
@@ -1116,3 +1161,10 @@ private var Player.playerSpecificSubtitleSpeed: Float
 
 /** Schemes Media3 streams over the network itself, as opposed to reading from local storage. */
 private val REMOTE_SCHEMES = setOf("http", "https", "rtsp")
+
+/**
+ * 变速切换音频管线时，禁用音轨与恢复音轨之间的间隔。
+ * 需要让 ExoPlayer 的播放线程把两次 TrackSelectionParameters 变更分两轮处理，
+ * 否则会被合并成一次，音轨从未真正被禁用，解码器也就不会重建。
+ */
+private const val AUDIO_RESELECT_GAP_MS = 150L
