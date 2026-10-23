@@ -7,6 +7,7 @@ import dev.anilbeesetti.nextplayer.core.data.repository.VaultRepository
 import dev.anilbeesetti.nextplayer.core.domain.GetHiddenVideosUseCase
 import dev.anilbeesetti.nextplayer.core.model.ApplicationPreferences
 import dev.anilbeesetti.nextplayer.core.model.MediaInfo
+import dev.anilbeesetti.nextplayer.core.model.MediaLayoutMode
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
 import dev.anilbeesetti.nextplayer.core.model.Sort
 import dev.anilbeesetti.nextplayer.core.model.Video
@@ -58,10 +59,10 @@ class VaultSortingTest {
         viewModel.onAction(VaultAction.SubmitUnlockPin("1234"))
         advanceUntilIdle()
 
-        assertEquals(titleAscending, viewModel.uiState.value.sort)
+        assertEquals(titleAscending, viewModel.state.value.sort)
         assertEquals(
             listOf("Alpha.mp4", "Bravo.mp4", "Zebra.mp4"),
-            viewModel.uiState.value.hiddenVideos.map { it.nameWithExtension },
+            viewModel.state.value.hiddenVideos.map { it.nameWithExtension },
         )
     }
 
@@ -78,10 +79,10 @@ class VaultSortingTest {
             viewModel.onAction(VaultAction.SubmitUnlockPin("1234"))
             advanceUntilIdle()
 
-            assertEquals(titleAscending, viewModel.uiState.value.sort)
+            assertEquals(titleAscending, viewModel.state.value.sort)
             assertEquals(
                 listOf("Alpha.mp4", "Bravo.mp4", "Zebra.mp4"),
-                viewModel.uiState.value.hiddenVideos.map { it.nameWithExtension },
+                viewModel.state.value.hiddenVideos.map { it.nameWithExtension },
             )
 
             viewModel.onAction(
@@ -91,10 +92,10 @@ class VaultSortingTest {
             )
             advanceUntilIdle()
 
-            assertEquals(sizeAscending, viewModel.uiState.value.sort)
+            assertEquals(sizeAscending, viewModel.state.value.sort)
             assertEquals(
                 listOf("Zebra.mp4", "Alpha.mp4", "Bravo.mp4"),
-                viewModel.uiState.value.hiddenVideos.map { it.nameWithExtension },
+                viewModel.state.value.hiddenVideos.map { it.nameWithExtension },
             )
             assertEquals(0, preferencesRepository.applicationUpdateCount)
             assertEquals(Sort.By.TITLE, preferencesRepository.applicationPreferences.value.sortBy)
@@ -116,10 +117,10 @@ class VaultSortingTest {
             )
             advanceUntilIdle()
 
-            assertEquals(sizeAscending, viewModel.uiState.value.sort)
+            assertEquals(sizeAscending, viewModel.state.value.sort)
             assertEquals(
                 listOf("Zebra.mp4", "Alpha.mp4", "Bravo.mp4"),
-                viewModel.uiState.value.hiddenVideos.map { it.nameWithExtension },
+                viewModel.state.value.hiddenVideos.map { it.nameWithExtension },
             )
         }
 
@@ -140,12 +141,12 @@ class VaultSortingTest {
             )
             advanceUntilIdle()
 
-            assertEquals(Sort.By.DATE, viewModel.uiState.value.preferences.sortBy)
-            assertEquals(Sort.Order.DESCENDING, viewModel.uiState.value.preferences.sortOrder)
-            assertEquals(sizeAscending, viewModel.uiState.value.sort)
+            assertEquals(Sort.By.DATE, viewModel.state.value.preferences.sortBy)
+            assertEquals(Sort.Order.DESCENDING, viewModel.state.value.preferences.sortOrder)
+            assertEquals(sizeAscending, viewModel.state.value.sort)
             assertEquals(
                 listOf("Zebra.mp4", "Alpha.mp4", "Bravo.mp4"),
-                viewModel.uiState.value.hiddenVideos.map { it.nameWithExtension },
+                viewModel.state.value.hiddenVideos.map { it.nameWithExtension },
             )
         }
 
@@ -165,13 +166,36 @@ class VaultSortingTest {
             )
             advanceUntilIdle()
 
-            assertEquals(Sort.By.SIZE, viewModel.uiState.value.preferences.sortBy)
-            assertEquals(Sort.Order.ASCENDING, viewModel.uiState.value.preferences.sortOrder)
-            assertEquals(titleAscending, viewModel.uiState.value.sort)
+            assertEquals(Sort.By.SIZE, viewModel.state.value.preferences.sortBy)
+            assertEquals(Sort.Order.ASCENDING, viewModel.state.value.preferences.sortOrder)
+            assertEquals(titleAscending, viewModel.state.value.sort)
             assertEquals(
                 listOf("Alpha.mp4", "Bravo.mp4", "Zebra.mp4"),
-                viewModel.uiState.value.hiddenVideos.map { it.nameWithExtension },
+                viewModel.state.value.hiddenVideos.map { it.nameWithExtension },
             )
+        }
+
+    @Test
+    fun `quick settings change layout and vault sort while preserving application sort and fields`() =
+        runTest(testDispatcher.scheduler) {
+            val preferencesRepository = FakePreferencesRepository(
+                ApplicationPreferences(sortBy = titleAscending.by, sortOrder = titleAscending.order, showSizeField = true),
+            )
+            val viewModel = createViewModel(preferencesRepository)
+            viewModel.onAction(VaultAction.SubmitUnlockPin("1234"))
+            advanceUntilIdle()
+
+            viewModel.onAction(VaultAction.UpdateQuickSettings(MediaLayoutMode.GRID, sizeAscending))
+            advanceUntilIdle()
+
+            assertEquals(sizeAscending, viewModel.state.value.sort)
+            assertEquals(listOf("Zebra.mp4", "Alpha.mp4", "Bravo.mp4"), viewModel.state.value.hiddenVideos.map { it.nameWithExtension })
+            assertEquals(MediaLayoutMode.GRID, viewModel.state.value.preferences.mediaLayoutMode)
+            assertEquals(
+                ApplicationPreferences(sortBy = titleAscending.by, sortOrder = titleAscending.order, showSizeField = true, mediaLayoutMode = MediaLayoutMode.GRID),
+                preferencesRepository.applicationPreferences.value,
+            )
+            assertEquals(1, preferencesRepository.applicationUpdateCount)
         }
 
     private fun createViewModel(preferencesRepository: FakePreferencesRepository): VaultViewModel {
@@ -204,6 +228,7 @@ class VaultSortingTest {
             ),
         )
         return VaultViewModel(
+            output = VaultViewModel.Output(navigateUp = {}, playVideo = {}, playVideos = {}),
             vaultRepository = vaultRepository,
             vaultPinRepository = FakeVaultPinRepository,
             getHiddenVideosUseCase = GetHiddenVideosUseCase(vaultRepository, testDispatcher),
@@ -224,6 +249,8 @@ class VaultSortingTest {
     private data object FakeVaultPinRepository : VaultPinRepository {
         override suspend fun hasPinSet(): Boolean = true
         override suspend fun setPin(pin: String) = Unit
+        override suspend fun isBiometricEnabled(): Boolean = false
+        override suspend fun setBiometricEnabled(enabled: Boolean) = Unit
         override suspend fun verifyPin(pin: String): Boolean = true
         override suspend fun hasShownHideConfirmation(): Boolean = false
         override suspend fun setHideConfirmationShown() = Unit

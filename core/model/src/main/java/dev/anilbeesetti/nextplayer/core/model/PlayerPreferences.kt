@@ -13,6 +13,7 @@ data class PlayerPreferences(
     val playerVideoZoom: VideoContentScale = VideoContentScale.BEST_FIT,
     val defaultPlaybackSpeed: Float = 1.0f,
     val autoplay: Boolean = true,
+    val enableTunneledPlayback: Boolean = false,
     val autoPip: Boolean = true,
     val autoBackgroundPlay: Boolean = false,
     val loopMode: LoopMode = LoopMode.OFF,
@@ -38,6 +39,7 @@ data class PlayerPreferences(
     val controlButtonsPosition: ControlButtonsPosition = ControlButtonsPosition.LEFT,
     val hidePlayerButtonsBackground: Boolean = false,
     val useMaterialYouControls: Boolean = false,
+    val showRemainingTime: Boolean = false,
 
     // Audio Preferences
     val preferredAudioLanguage: String = "",
@@ -55,9 +57,6 @@ data class PlayerPreferences(
     val subtitleFont: Font = Font.DEFAULT,
     val subtitleTextBold: Boolean = true,
     val applyEmbeddedStyles: Boolean = true,
-
-    // Decoder Preferences
-    val decoderPriority: DecoderPriority = DecoderPriority.PREFER_DEVICE,
 ) {
 
     companion object {

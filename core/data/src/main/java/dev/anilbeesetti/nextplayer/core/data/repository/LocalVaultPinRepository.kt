@@ -1,18 +1,16 @@
 package dev.anilbeesetti.nextplayer.core.data.repository
 
 import android.content.Context
-import dagger.hilt.android.qualifiers.ApplicationContext
+import androidx.core.content.edit
 import java.security.MessageDigest
 import java.security.SecureRandom
-import javax.inject.Inject
-import javax.inject.Singleton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import androidx.core.content.edit
+import org.koin.core.annotation.Single
 
-@Singleton
-class LocalVaultPinRepository @Inject constructor(
-    @ApplicationContext private val context: Context,
+@Single
+class LocalVaultPinRepository(
+    private val context: Context,
 ) : VaultPinRepository {
 
     private val preferences by lazy {
@@ -28,6 +26,7 @@ class LocalVaultPinRepository @Inject constructor(
         preferences.edit {
             putString(KEY_PIN_HASH, hashPin(pin, salt))
             putString(KEY_SALT, salt)
+            putBoolean(KEY_BIOMETRIC_ENABLED, false)
         }
     }
 
@@ -39,6 +38,14 @@ class LocalVaultPinRepository @Inject constructor(
 
     override suspend fun hasShownHideConfirmation(): Boolean = withContext(Dispatchers.IO) {
         preferences.getBoolean(KEY_HIDE_CONFIRMATION_SHOWN, false)
+    }
+
+    override suspend fun isBiometricEnabled(): Boolean = withContext(Dispatchers.IO) {
+        preferences.getBoolean(KEY_BIOMETRIC_ENABLED, false)
+    }
+
+    override suspend fun setBiometricEnabled(enabled: Boolean) = withContext(Dispatchers.IO) {
+        preferences.edit { putBoolean(KEY_BIOMETRIC_ENABLED, enabled) }
     }
 
     override suspend fun setHideConfirmationShown() = withContext(Dispatchers.IO) {
@@ -63,6 +70,7 @@ class LocalVaultPinRepository @Inject constructor(
         private const val PREFS_NAME = "vault_security_prefs"
         private const val KEY_PIN_HASH = "vault_pin_hash"
         private const val KEY_SALT = "vault_pin_salt"
+        private const val KEY_BIOMETRIC_ENABLED = "vault_biometric_enabled"
         private const val KEY_HIDE_CONFIRMATION_SHOWN = "vault_hide_confirmation_shown"
     }
 }

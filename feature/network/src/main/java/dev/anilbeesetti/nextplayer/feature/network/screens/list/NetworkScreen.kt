@@ -6,17 +6,17 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -25,7 +25,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.surfaceColorAtElevation
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,71 +36,61 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.PreviewLightDark
 import androidx.compose.ui.unit.dp
-import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.anilbeesetti.nextplayer.core.common.extensions.isTelevision
 import dev.anilbeesetti.nextplayer.core.model.NetworkConnection
 import dev.anilbeesetti.nextplayer.core.model.NetworkProtocol
 import dev.anilbeesetti.nextplayer.core.ui.R
+import dev.anilbeesetti.nextplayer.core.ui.components.BindTopLevelFab
+import dev.anilbeesetti.nextplayer.core.ui.components.LocalNavigationBottomPadding
 import dev.anilbeesetti.nextplayer.core.ui.components.NextDialog
+import dev.anilbeesetti.nextplayer.core.ui.components.NextOutlinedTextField
 import dev.anilbeesetti.nextplayer.core.ui.components.NextSegmentedListItem
 import dev.anilbeesetti.nextplayer.core.ui.components.NextTopAppBar
-import dev.anilbeesetti.nextplayer.core.ui.components.requestFocusUntilLanded
-import dev.anilbeesetti.nextplayer.core.ui.components.rememberTvListFocusRequester
+import dev.anilbeesetti.nextplayer.core.ui.components.TopLevelFabKey
+import dev.anilbeesetti.nextplayer.core.ui.components.thenIf
 import dev.anilbeesetti.nextplayer.core.ui.components.tvFocusRing
 import dev.anilbeesetti.nextplayer.core.ui.components.tvListFocus
 import dev.anilbeesetti.nextplayer.core.ui.designsystem.NextIcons
+import dev.anilbeesetti.nextplayer.core.ui.extensions.copy
 import dev.anilbeesetti.nextplayer.core.ui.theme.NextPlayerTheme
 
 @Composable
-fun NetworkScreenRoute(
-    onAddConnection: () -> Unit,
-    onEditConnection: (Long) -> Unit,
-    onOpenConnection: (Long) -> Unit,
-    onSettingsClick: () -> Unit,
-    viewModel: NetworkViewModel = hiltViewModel(),
+fun NetworkScreen(
+    viewModel: NetworkViewModel,
 ) {
-    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    NetworkScreen(
-        uiState = uiState,
-        onAddConnection = onAddConnection,
-        onEditConnection = onEditConnection,
-        onOpenConnection = onOpenConnection,
-        onSettingsClick = onSettingsClick,
-        onDeleteConnection = viewModel::deleteConnection,
+    val state by viewModel.state.collectAsStateWithLifecycle()
+
+    NetworkScreenContent(
+        state = state,
+        onAction = viewModel::onAction,
     )
 }
 
 @Composable
-internal fun NetworkScreen(
-    uiState: NetworkUiState,
-    onAddConnection: () -> Unit,
-    onEditConnection: (Long) -> Unit,
-    onOpenConnection: (Long) -> Unit,
-    onSettingsClick: () -> Unit,
-    onDeleteConnection: (Long) -> Unit,
+internal fun NetworkScreenContent(
+    state: NetworkUiState,
+    onAction: (NetworkAction) -> Unit,
 ) {
     var connectionToDelete by remember { mutableStateOf<NetworkConnection?>(null) }
+    var streamUrl by rememberSaveable { mutableStateOf("") }
+    val trimmedStreamUrl = streamUrl.trim()
+    val fabUpFocusRequester = remember { FocusRequester() }
 
-    val context = LocalContext.current
-    val isTv = remember { context.isTelevision }
-    val showEmptyState = uiState.connections.isEmpty() && !uiState.isLoading
-    // The connection list grabs D-pad focus via tvListFocus, but the empty state has nothing
-    // focusable, so focus would fall back to the Home tab. Land it on the Add-connection button.
-    val addConnectionFocusRequester = remember { FocusRequester() }
-    if (isTv) {
-        LaunchedEffect(showEmptyState) {
-            if (showEmptyState) addConnectionFocusRequester.requestFocusUntilLanded()
-        }
-    }
+    val showEmptyState = state.connections.isEmpty() && !state.isLoading
+    BindTopLevelFab(
+        key = TopLevelFabKey.NETWORK,
+        icon = NextIcons.Add,
+        upFocusRequester = fabUpFocusRequester,
+        onClick = { onAction(NetworkAction.AddConnection) },
+    )
+    val navigationBottomPadding = LocalNavigationBottomPadding.current
 
     Scaffold(
         topBar = {
@@ -109,7 +98,7 @@ internal fun NetworkScreen(
                 title = stringResource(R.string.network),
                 fontWeight = FontWeight.Bold,
                 actions = {
-                    IconButton(onClick = onSettingsClick, modifier = Modifier.tvFocusRing()) {
+                    IconButton(onClick = { onAction(NetworkAction.OpenSettings) }, modifier = Modifier.tvFocusRing()) {
                         Icon(
                             imageVector = NextIcons.Settings,
                             contentDescription = stringResource(R.string.settings),
@@ -118,51 +107,48 @@ internal fun NetworkScreen(
                 },
             )
         },
-        floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = onAddConnection,
-                icon = { Icon(NextIcons.Add, contentDescription = null) },
-                text = { Text(stringResource(R.string.add_connection)) },
-                modifier = Modifier
-                    .focusRequester(addConnectionFocusRequester)
-                    .tvFocusRing(shape = RoundedCornerShape(16.dp)),
-            )
-        },
         containerColor = MaterialTheme.colorScheme.surfaceContainer,
-    ) { padding ->
-        val containerModifier = Modifier
-            .fillMaxSize()
-            .padding(top = padding.calculateTopPadding())
-            .padding(start = padding.calculateStartPadding(LocalLayoutDirection.current) + 2.dp)
-            .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
-            .background(MaterialTheme.colorScheme.background)
-
-        Box(modifier = containerModifier) {
-            if (showEmptyState) {
-                NetworkEmptyState(modifier = Modifier.fillMaxSize())
-            } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .tvListFocus(rememberTvListFocusRequester()),
-                    contentPadding = PaddingValues(
-                        start = 8.dp,
-                        end = 8.dp,
-                        top = 8.dp,
-                        bottom = padding.calculateBottomPadding() + 96.dp,
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
+    ) { scaffoldPadding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(scaffoldPadding.copy(bottom = 0.dp))
+                .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
+                .background(MaterialTheme.colorScheme.background),
+        ) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .tvListFocus(),
+                contentPadding = PaddingValues(8.dp).copy(
+                    bottom = scaffoldPadding.calculateBottomPadding() + navigationBottomPadding,
+                ),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                item {
+                    NetworkStreamCard(
+                        url = streamUrl,
+                        onUrlChange = { streamUrl = it },
+                        onOpenStream = { onAction(NetworkAction.OpenStream(trimmedStreamUrl.toUri())) },
+                        enabled = trimmedStreamUrl.isNotEmpty(),
+                        fabUpFocusRequester = fabUpFocusRequester,
+                    )
+                }
+                if (showEmptyState) {
+                    item {
+                        NetworkEmptyState()
+                    }
+                } else {
                     itemsIndexed(
-                        items = uiState.connections,
+                        items = state.connections,
                         key = { _, connection -> connection.id },
                     ) { index, connection ->
                         ConnectionItem(
                             connection = connection,
                             isFirstItem = index == 0,
-                            isLastItem = index == uiState.connections.lastIndex,
-                            onClick = { onOpenConnection(connection.id) },
-                            onEdit = { onEditConnection(connection.id) },
+                            isLastItem = index == state.connections.lastIndex,
+                            onClick = { onAction(NetworkAction.OpenConnection(connection.id)) },
+                            onEdit = { onAction(NetworkAction.EditConnection(connection.id)) },
                             onDelete = { connectionToDelete = connection },
                         )
                     }
@@ -179,7 +165,7 @@ internal fun NetworkScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        onDeleteConnection(connection.id)
+                        onAction(NetworkAction.DeleteConnection(connection.id))
                         connectionToDelete = null
                     },
                 ) { Text(stringResource(R.string.delete)) }
@@ -190,6 +176,53 @@ internal fun NetworkScreen(
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun NetworkStreamCard(
+    modifier: Modifier = Modifier,
+    url: String,
+    onUrlChange: (String) -> Unit,
+    onOpenStream: () -> Unit,
+    enabled: Boolean,
+    fabUpFocusRequester: FocusRequester,
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(24.dp))
+            .background(MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            text = stringResource(R.string.network_stream),
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        Text(
+            text = stringResource(R.string.enter_a_network_url),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        NextOutlinedTextField(
+            value = url,
+            onValueChange = onUrlChange,
+            modifier = Modifier
+                .fillMaxWidth()
+                .thenIf(!enabled) { focusRequester(fabUpFocusRequester) },
+            placeholder = { Text(stringResource(R.string.example_url)) },
+            singleLine = true,
+        )
+        Button(
+            onClick = onOpenStream,
+            enabled = enabled,
+            modifier = Modifier
+                .align(Alignment.End)
+                .thenIf(enabled) { focusRequester(fabUpFocusRequester) },
+        ) {
+            Text(stringResource(R.string.open_network_stream))
+        }
     }
 }
 
@@ -275,7 +308,7 @@ private fun ConnectionItem(
 @Composable
 private fun NetworkEmptyState(modifier: Modifier = Modifier) {
     Column(
-        modifier = modifier.padding(horizontal = 32.dp),
+        modifier = modifier.padding(horizontal = 32.dp, vertical = 48.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -312,13 +345,9 @@ internal fun NetworkProtocol.icon(): ImageVector = when (this) {
 @Composable
 private fun NetworkScreenPreview() {
     NextPlayerTheme {
-        NetworkScreen(
-            uiState = NetworkUiState(connections = listOf(NetworkConnection.sample), isLoading = false),
-            onAddConnection = {},
-            onEditConnection = {},
-            onOpenConnection = {},
-            onSettingsClick = {},
-            onDeleteConnection = {},
+        NetworkScreenContent(
+            state = NetworkUiState(connections = listOf(NetworkConnection.sample), isLoading = false),
+            onAction = {},
         )
     }
 }

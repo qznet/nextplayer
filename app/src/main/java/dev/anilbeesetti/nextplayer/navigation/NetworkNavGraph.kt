@@ -20,6 +20,7 @@ fun EntryProviderScope<NavKey>.networkNavGraph(
         onEditConnection = { id -> backStack.navigateToAddConnection(id) },
         onOpenConnection = { id -> backStack.navigateToNetworkBrowse(id) },
         onSettingsClick = backStack::navigateToSettings,
+        onOpenStream = { uri -> context.startPlayback(uri) },
     )
 
     addConnectionEntry(
@@ -28,7 +29,7 @@ fun EntryProviderScope<NavKey>.networkNavGraph(
 
     networkBrowseEntry(
         onNavigateUp = { backStack.removeLastIfNotRoot() },
-        onPlayVideo = { uri -> context.startPlayback(uri) },
+        onPlayVideos = { uris, startUri -> context.startPlayback(uris, startUri) },
         onNavigateToFolder = { id, path -> backStack.navigateToNetworkBrowse(id, path) },
     )
 }
