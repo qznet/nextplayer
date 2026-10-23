@@ -19,6 +19,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync upstream and push to fork
+        # 只在 main 上同步上游；在特性分支上手跑时按分支原样构建，避免把分支推到 main。
+        if: github.ref == 'refs/heads/main'
         run: |
           # git 身份必须显式设置：checkout 出来的仓库没有 user.name/user.email，
           # 合并需要创建 merge commit 时会报 "fatal: empty ident name ... not allowed"，
@@ -49,6 +51,8 @@ jobs:
         run: ./gradlew assembleRelease-with-debug-signing --stacktrace
 
       - name: Publish / update latest release
+        # 只有 main 的构建才更新 latest，分支验证构建只留 artifact，避免半成品被当成正式包。
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: qznet/nextplayer
@@ -56,15 +60,15 @@ jobs:
           gh release delete latest --yes || true
           git push origin :refs/tags/latest || true
           NOTES=$(cat <<'EOF'
-          自动同步上游 AnilBeesetti/nextplayer 最新代码，叠加本 fork 两项改造：
-          1. Navigation3 钉回 1.1.5，修复导航栏消失（Nav3 1.1.6 把 contentKey 改为 NavKey 对象导致的回归）
-          2. 全屏播放 DPAD_UP/DOWN 按 0.1 步进调倍速（0.2~4.0）+ Toast 提示
+          自动同步上游 AnilBeesetti/nextplayer 最新代码，叠加本 fork 的改造：
+          1. 全屏播放 DPAD_UP/DOWN 按 0.1 步进调倍速（0.2~4.0）+ Toast 提示
+          2. 非 1 倍速时关闭音频透传，解码为 PCM 并下混 2 声道；回到 1 倍速自动恢复透传
 
           包名 dev.anilbeesetti.nextplayer.release（debug key 签名）。优先装 arm64-v8a，老 32 位盒子用 universal。
           上游每次有更新，本 release 会自动重建。
           EOF
           )
           gh release create latest \
-            --title "NextPlayer TV 版（导航修复 + 上下键倍速 · latest）" \
+            --title "NextPlayer TV 版（上下键倍速 + 非1倍速转2声道PCM · latest）" \
             --notes "$NOTES" \
             app/build/outputs/apk/release-with-debug-signing/*.apk
