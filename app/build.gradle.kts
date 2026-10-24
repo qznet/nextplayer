@@ -71,10 +71,23 @@ android {
             //noinspection WrongGradleMethod
             val isBuildingBundle = gradle.startParameter.taskNames.any { it.lowercase().contains("bundle") }
 
+            // 日常测试构建默认只出 armeabi-v7a（电视/盒子上用，编译快、产物少）。
+            // 需要全量（正式 release，或明确指定）时传 -PnextplayerAbis=all。
+            val requested = (providers.gradleProperty("nextplayerAbis").orNull ?: "v7a")
+                .split(',')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+            val buildAll = requested.isEmpty() || requested.any { it.equals("all", true) } || requested.size > 1
+            val selected = if (buildAll) {
+                listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            } else {
+                requested
+            }
+
             isEnable = !isBuildingBundle
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            isUniversalApk = true
+            include(*selected.toTypedArray())
+            isUniversalApk = buildAll
         }
     }
 

@@ -2,6 +2,14 @@ name: Build NextPlayer APK (auto sync upstream)
 
 on:
   workflow_dispatch:
+    inputs:
+      abis:
+        description: "构建哪些 ABI。日常测试保持 v7a 即可（快）；正式版发布或确实需要全量时才选 all"
+        type: choice
+        options:
+          - v7a
+          - all
+        default: v7a
   schedule:
     - cron: "0 18 * * *"   # UTC 18:00 = 北京时间 02:00 每日
 
@@ -48,7 +56,10 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build release APK (signed with debug key, no secret needed)
-        run: ./gradlew assembleRelease-with-debug-signing --stacktrace
+        # 默认只出 armeabi-v7a；需要全量传 all（workflow_dispatch 选 all，或 ./gradlew ... -PnextplayerAbis=all）。
+        env:
+          ABIS: ${{ github.event.inputs.abis || 'v7a' }}
+        run: ./gradlew assembleRelease-with-debug-signing -PnextplayerAbis="$ABIS" --stacktrace
 
       - name: Upload APK artifacts
         # 无论 release 发布是否成功，构建产物都能从 run 的 artifact 下载。
@@ -75,7 +86,8 @@ jobs:
           1. 全屏播放 DPAD_UP/DOWN 按 0.1 步进调倍速（0.2~4.0）+ Toast 提示
           2. 非 1 倍速时关闭音频透传，解码为 PCM 并下混 2 声道；回到 1 倍速自动恢复透传
 
-          包名 dev.anilbeesetti.nextplayer.release（debug key 签名）。优先装 arm64-v8a，老 32 位盒子用 universal。
+          包名 dev.anilbeesetti.nextplayer.release（debug key 签名）。
+          ABI 策略：日常/测试构建默认只出 armeabi-v7a；只有正式版发布或明确指定时才出全量（arm64-v8a / x86 / universal）。
           上游每次有更新，本 release 会自动重建。
           EOF
           )
