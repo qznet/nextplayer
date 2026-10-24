@@ -72,12 +72,16 @@ class PassthroughGateAudioSink(
  * 把多声道 PCM 下混成 2 声道。
  *
  * 只在需要时生效：`configure` 阶段读一次 [AudioSpeedPcmMode.forcePcm]，不满足就返回
- * `NOT_SET` 表示本处理器不参与（PCM 直通），因此 1 倍速下的 PCM 多声道源行为不变。
- * 速度跨过 1 倍时会触发音轨重选（见 PlayerService），sink 会重新 configure，
- * 闸门因此被重新求值。
+ * `NOT_SET` 表示本处理器不参与，因此 1 倍速下的行为（直通，或非直通时的多声道 PCM）不变。
+ * 速度跨过 1 倍时会触发音轨重选（见 PlayerService），渲染器重建 AudioTrack，
+ * sink 会重新 configure，闸门与下混因此被重新求值（实测 AudioTrack session 会变化）。
  *
- * 用 media3 自带的 `ChannelMixingAudioProcessor` + `ChannelMixingMatrix.createForConstantGain`
- * 做下混（含中置/环绕折叠），而不是简单丢掉多余声道——只取前两声道会丢掉对白。
+ * 矩阵必须自己给，不能用 media3 的便捷方法：
+ * `ChannelMixingMatrix.createForConstantGain/createForConstantPower` 只实现了
+ * in==out、1→2、2→1 三种组合，其它组合直接抛 `UnsupportedOperationException`
+ * （已用 media3-common 1.11.1 字节码核实：`createConstantGainMixingCoefficients`
+ * 在 default 分支抛异常）。之前 5.1→2.0 走这条路径被 `runCatching` 静默吞掉，
+ * 表现就是"非 1 倍速下仍是 6 声道 PCM 直进 ARC、中置人声发怪"。
  */
 @UnstableApi
 internal class DownmixToStereoAudioProcessor(
@@ -94,13 +98,11 @@ internal class DownmixToStereoAudioProcessor(
         val channelCount = inputAudioFormat.channelCount
         if (channelCount <= STEREO_CHANNEL_COUNT) return AudioProcessor.AudioFormat.NOT_SET
 
+        val matrix = buildStereoDownmixMatrix(channelCount) ?: return AudioProcessor.AudioFormat.NOT_SET
         val processor = ChannelMixingAudioProcessor()
-        val matrix = runCatching {
-            ChannelMixingMatrix.createForConstantGain(channelCount, STEREO_CHANNEL_COUNT)
-        }.getOrNull() ?: return AudioProcessor.AudioFormat.NOT_SET
         processor.putChannelMixingMatrix(matrix)
 
-        // 下混矩阵可能是恒等/不适用，交给它自己判断；任何异常都退化为不做下混，保证还有声音。
+        // 任何异常都退化为不做下混，保证还有声音。
         val outputFormat = runCatching { processor.configure(inputAudioFormat) }.getOrNull()
             ?: return AudioProcessor.AudioFormat.NOT_SET
         if (!processor.isActive) return AudioProcessor.AudioFormat.NOT_SET
@@ -136,6 +138,71 @@ internal class DownmixToStereoAudioProcessor(
 
     private companion object {
         const val STEREO_CHANNEL_COUNT = 2
+
+        /** 中置（人声）下混增益 -3dB。 */
+        const val CENTER_GAIN = 0.7071f
+
+        /** 环绕下混增益 -6dB，压低一点避免把对白糊掉。 */
+        const val SURROUND_GAIN = 0.5f
+
+        /**
+         * 手写 多声道 → 2.0 下混矩阵。
+         *
+         * 系数按"输入声道主序"排列：`coefficients[input * outputChannelCount + output]`
+         * （已用 media3-common 1.11.1 字节码核实构造器只校验长度 = in*out）。
+         * 声道顺序沿用 Android MediaCodec 解码器输出的默认布局。
+         * 主声道保持单位增益，避免整体音量变小；LFE 直接丢弃。
+         */
+        fun buildStereoDownmixMatrix(channelCount: Int): ChannelMixingMatrix? {
+            val out = STEREO_CHANNEL_COUNT
+            val coefficients = FloatArray(channelCount * out)
+
+            fun set(input: Int, left: Float, right: Float) {
+                if (input >= channelCount) return
+                coefficients[input * out] = left
+                coefficients[input * out + 1] = right
+            }
+
+            // 所有布局的前两个声道都是 FL / FR
+            set(0, 1f, 0f)
+            set(1, 0f, 1f)
+
+            when (channelCount) {
+                3 -> { // FL FR FC
+                    set(2, CENTER_GAIN, CENTER_GAIN)
+                }
+                4 -> { // FL FR BL BR
+                    set(2, SURROUND_GAIN, 0f)
+                    set(3, 0f, SURROUND_GAIN)
+                }
+                5 -> { // FL FR FC BL BR
+                    set(2, CENTER_GAIN, CENTER_GAIN)
+                    set(3, SURROUND_GAIN, 0f)
+                    set(4, 0f, SURROUND_GAIN)
+                }
+                6 -> { // FL FR FC LFE BL BR（5.1）
+                    set(2, CENTER_GAIN, CENTER_GAIN)
+                    set(4, SURROUND_GAIN, 0f)
+                    set(5, 0f, SURROUND_GAIN)
+                }
+                7 -> { // FL FR FC LFE BC SL SR（6.1）
+                    set(2, CENTER_GAIN, CENTER_GAIN)
+                    set(4, 0.5f, 0.5f)
+                    set(5, SURROUND_GAIN, 0f)
+                    set(6, 0f, SURROUND_GAIN)
+                }
+                8 -> { // FL FR FC LFE BL BR SL SR（7.1）
+                    set(2, CENTER_GAIN, CENTER_GAIN)
+                    set(4, SURROUND_GAIN, 0f)
+                    set(5, 0f, SURROUND_GAIN)
+                    set(6, 0.4f, 0f)
+                    set(7, 0f, 0.4f)
+                }
+                else -> return null
+            }
+
+            return runCatching { ChannelMixingMatrix(channelCount, out, coefficients) }.getOrNull()
+        }
     }
 }
 
