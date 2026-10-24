@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
@@ -98,6 +99,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import org.koin.android.ext.android.inject
+import kotlin.math.abs
 
 @OptIn(UnstableApi::class)
 class PlayerService : MediaSessionService() {
@@ -130,6 +132,14 @@ class PlayerService : MediaSessionService() {
     private var speedAudioFactory: SpeedAwareRenderersFactory? = null
     private val reselectHandler = Handler(Looper.getMainLooper())
     private val decoderRecoveryManager = DecoderRecoveryManager()
+
+    // 音频管线切换（直通 <-> 解码）的状态。切换是一次异步重选：禁用音轨 -> 等
+    // onTracksChanged -> 恢复音轨 -> 延迟校验实际状态，不成立就重试。
+    private var audioModePending = false
+    private var audioModePendingSpeed = 1f
+    private var audioModeRetries = 0
+    private var audioModeSwitchMs = 0L
+    private var audioRestartInFlight = false
 
     private val decoderAnalyticsListener = object : AnalyticsListener {
         override fun onEvents(player: Player, events: AnalyticsListener.Events) {
@@ -281,6 +291,9 @@ class PlayerService : MediaSessionService() {
 
         override fun onTracksChanged(tracks: Tracks) {
             super.onTracksChanged(tracks)
+            // 我们自己禁用音轨引发的轨道变化：恢复音轨、补上速度、安排校验。
+            // 这一次变化不代表用户换了片源，所以不再往下走其余逻辑。
+            if (handleAudioReselectTracksChanged()) return
             serviceScope.launch {
                 mediaSession?.player?.currentTracks?.let(::handleUnsupportedTracks)
             }
@@ -703,36 +716,154 @@ class PlayerService : MediaSessionService() {
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
     /**
-     * 播放速度跨过 1 倍时切换音频管线：非 1 倍速关闭直通、解码成 PCM 并下混 2 声道。
+     * 播放速度跨过 1 倍时切换音频管线：
+     * 1 倍速把压缩音轨（AC3 / E-AC3）直通给功放，其它速度解码成 PCM 并折叠 2 声道。
      *
      * 光改闸门不够。media3 不会因为变速重新决策"直通还是解码"——
      * `MediaCodecAudioRenderer.setPlaybackParameters` 只是把参数转发给 `AudioSink`
-     * （已用 1.11.1 字节码确认），渲染器不会重建解码器。所以这里临时把音轨类型禁用再恢复：
-     * 禁用会让音频渲染器释放解码器，恢复时重新选轨，`shouldUseBypass` 会按新的闸门重算。
+     * （已用 1.11.1 字节码确认），渲染器不会重建解码器。所以必须把音轨类型禁用再恢复，
+     * 让音频渲染器重新选轨、`shouldUseBypass` 按新闸门重算。
      *
-     * 中间隔 [AUDIO_RESELECT_GAP_MS]，确保两次参数变更落在播放线程的不同轮次，
-     * 否则两次更新可能被合并成一次、根本不会触发重选。
+     * 这里用 [Player.Listener.onTracksChanged] 当"重选完成"的信号，而不是定时盲等；
+     * 完成后 [AUDIO_MODE_VERIFY_DELAY_MS] 再校验一次**实际**状态
+     * （[PassthroughGateAudioSink.isPassthrough]），不符就重试，最多 [AUDIO_MODE_MAX_RETRIES] 次。
+     * 这套闭环照 JustPlus.Player（com.brouken.player.PlayerActivity）的做法，比开环等待可靠。
      */
     private fun updateSpeedAudioMode(speed: Float) {
-        val factory = speedAudioFactory ?: return
-        val forcePcm = speed != 1f
-        if (factory.speedPcmMode.forcePcm == forcePcm) return
-        factory.speedPcmMode.forcePcm = forcePcm
-
+        val sink = speedAudioFactory?.gateSink ?: return
         val player = mediaSession?.player as? ExoPlayer ?: return
+
+        val wantPassthrough = abs(speed - 1f) <= SPEED_UNITY_EPSILON
+        // 闸门同值说明还停在同一侧，管线不用动
+        if (!sink.setForceDecode(!wantPassthrough)) return
+        // 实际状态已经等于目标态（例如片源本身是 PCM），不必重选
+        if (sink.isPassthrough == wantPassthrough) {
+            audioModePending = false
+            Logger.logInfo(
+                AUDIO_LOG_TAG,
+                "audio mode: already ${audioModeName(wantPassthrough)} at $speed",
+            )
+            return
+        }
+
+        audioModeRetries = 0
+        audioModePending = true
+        audioModePendingSpeed = speed
+        Logger.logInfo(
+            AUDIO_LOG_TAG,
+            "audio mode: switching to ${audioModeName(wantPassthrough)} at $speed " +
+                "(playing=${player.isPlaying})",
+        )
+
+        // 没在播放：等真正开播时的 onTracksChanged 再补速度，避免停着反复重选
+        if (!player.isPlaying) return
+
+        val now = SystemClock.uptimeMillis()
+        val sinceLast = now - audioModeSwitchMs
+        if (sinceLast < AUDIO_MODE_MIN_INTERVAL_MS) {
+            // 连按上下键时把重选延后到最小间隔之后，避免一路重选把声音打断
+            val delay = AUDIO_MODE_MIN_INTERVAL_MS - sinceLast
+            reselectHandler.removeCallbacks(audioModeReselectRunnable)
+            reselectHandler.postDelayed(audioModeReselectRunnable, delay)
+            Logger.logInfo(AUDIO_LOG_TAG, "audio mode: reselect in ${delay}ms")
+            return
+        }
+        reselectAudioTrackForMode()
+    }
+
+    private val audioModeReselectRunnable = Runnable { reselectAudioTrackForMode() }
+
+    /** 禁用音轨类型逼渲染器重新选轨；结果由 [handleAudioReselectTracksChanged] 接手。 */
+    private fun reselectAudioTrackForMode() {
+        if (audioRestartInFlight) return
+        val player = mediaSession?.player as? ExoPlayer ?: return
+        audioRestartInFlight = true
+        audioModeSwitchMs = SystemClock.uptimeMillis()
+        Logger.logInfo(AUDIO_LOG_TAG, "audio mode: reselect")
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
             .build()
-        reselectHandler.removeCallbacks(restoreAudioTrackType)
-        reselectHandler.postDelayed(restoreAudioTrackType, AUDIO_RESELECT_GAP_MS)
     }
 
-    private val restoreAudioTrackType = Runnable {
-        val player = mediaSession?.player as? ExoPlayer ?: return@Runnable
+    /**
+     * @return true 表示这次轨道变化是我们自己引起的重选，调用方应跳过其余处理。
+     */
+    private fun handleAudioReselectTracksChanged(): Boolean {
+        if (!audioRestartInFlight) return false
+        audioRestartInFlight = false
+        val player = mediaSession?.player as? ExoPlayer ?: return true
+        Logger.logInfo(AUDIO_LOG_TAG, "audio reselect: restore")
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
             .build()
+        if (audioModePending) {
+            audioModePending = false
+            Logger.logInfo(AUDIO_LOG_TAG, "audio mode: rate $audioModePendingSpeed after reselect")
+            player.playbackParameters = PlaybackParameters(audioModePendingSpeed)
+        }
+        reselectHandler.removeCallbacks(audioModeVerifyRunnable)
+        reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
+        return true
     }
+
+    /**
+     * 校验实际音频管线是否符合当前速度的要求，不符则重试。
+     *
+     * 只在选中音轨是压缩格式时才有意义：PCM 片源永远不会直通，
+     * 拿它去比对会白重试两次（JustPlus 同样先看 selected mime）。
+     */
+    private val audioModeVerifyRunnable = Runnable {
+        val sink = speedAudioFactory?.gateSink ?: return@Runnable
+        val player = mediaSession?.player ?: return@Runnable
+
+        if (audioRestartInFlight) {
+            // onTracksChanged 一直没来，音轨可能还挂在被禁用的状态，强行恢复再试一次
+            Logger.logInfo(AUDIO_LOG_TAG, "audio mode: reselect never reported, releasing it")
+            audioRestartInFlight = false
+            if (!player.currentTracks.isTypeSelected(C.TRACK_TYPE_AUDIO)) {
+                (player as? ExoPlayer)?.let { exoPlayer ->
+                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                        .buildUpon()
+                        .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                        .build()
+                }
+            }
+            reselectHandler.removeCallbacks(audioModeReselectRunnable)
+            reselectHandler.postDelayed(audioModeReselectRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
+            return@Runnable
+        }
+
+        val selectedMime = player.currentTracks.groups
+            .filter { it.type == C.TRACK_TYPE_AUDIO }
+            .firstOrNull { it.isSelected }
+            ?.mediaTrackGroup?.getFormat(0)?.sampleMimeType
+        if (selectedMime == null || selectedMime == MimeTypes.AUDIO_RAW) return@Runnable
+
+        val speed = player.playbackParameters.speed
+        val wantPassthrough = abs(speed - 1f) <= SPEED_UNITY_EPSILON
+        if (sink.isPassthrough == wantPassthrough || !player.isPlaying) return@Runnable
+
+        if (audioModeRetries >= AUDIO_MODE_MAX_RETRIES) {
+            Logger.logInfo(
+                AUDIO_LOG_TAG,
+                "audio mode: still ${audioModeName(!wantPassthrough)} at $speed after " +
+                    "$audioModeRetries retries, leaving it",
+            )
+            return@Runnable
+        }
+        audioModeRetries++
+        Logger.logInfo(
+            AUDIO_LOG_TAG,
+            "audio mode: still ${audioModeName(!wantPassthrough)} at $speed, retry $audioModeRetries",
+        )
+        audioModePending = true
+        audioModePendingSpeed = speed
+        audioModeSwitchMs = SystemClock.uptimeMillis()
+        reselectAudioTrackForMode()
+    }
+
+    private fun audioModeName(passthrough: Boolean): String =
+        if (passthrough) "pass-through" else "decoded"
 
     override fun onCreate() {
         super.onCreate()
@@ -1117,6 +1248,20 @@ private val DecoderTrackType.mediaTrackType: Int
 
 private const val DECODER_LOG_TAG = "Decoder"
 
+private const val AUDIO_LOG_TAG = "AudioMode"
+
+/** 判定"还在 1 倍速"的容差；与 JustPlus.Player 取值一致。 */
+private const val SPEED_UNITY_EPSILON = 0.005f
+
+/** 两次管线切换之间的最小间隔，避免连按上下键时反复重选打断声音。 */
+private const val AUDIO_MODE_MIN_INTERVAL_MS = 900L
+
+/** 重选完成后等多久校验实际状态（给渲染器、AudioTrack 留出初始化时间）。 */
+private const val AUDIO_MODE_VERIFY_DELAY_MS = 700L
+
+/** 校验不通过时最多重试几次。 */
+private const val AUDIO_MODE_MAX_RETRIES = 2
+
 @get:UnstableApi
 @set:UnstableApi
 private var Player.playerSpecificSkipSilenceEnabled: Boolean
@@ -1167,4 +1312,3 @@ private val REMOTE_SCHEMES = setOf("http", "https", "rtsp")
  * 需要让 ExoPlayer 的播放线程把两次 TrackSelectionParameters 变更分两轮处理，
  * 否则会被合并成一次，音轨从未真正被禁用，解码器也就不会重建。
  */
-private const val AUDIO_RESELECT_GAP_MS = 150L
