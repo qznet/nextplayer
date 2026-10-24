@@ -171,7 +171,7 @@ internal class DownmixToStereoAudioProcessor(
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
-        if (!inputBuffer.hasRemaining) return
+        if (!inputBuffer.hasRemaining()) return
         val matrix = gains ?: return
         val channels = inputChannels
         if (channels <= 0) return
