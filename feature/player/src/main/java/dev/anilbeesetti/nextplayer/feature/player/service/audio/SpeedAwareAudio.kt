@@ -447,6 +447,11 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         enableFloatOutput: Boolean,
         enableAudioOutputPlaybackParameters: Boolean,
     ): AudioSink? {
+        sinkBuildCount++
+        AudioDiag.log(
+            "buildAudioSink #$sinkBuildCount (float=$enableFloatOutput " +
+                "playbackParams=$enableAudioOutputPlaybackParameters)",
+        )
         val sink = DefaultAudioSink.Builder(context)
             .setAudioCapabilities(forcedAudioCapabilities(context))
             .setEnableFloatOutput(enableFloatOutput)
@@ -459,6 +464,8 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
             .build()
         return PassthroughGateAudioSink(speedPcmMode, sink).also { gateSink = it }
     }
+
+    private var sinkBuildCount = 0
 }
 
 /**

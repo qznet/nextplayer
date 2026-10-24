@@ -144,6 +144,25 @@ class PlayerService : MediaSessionService() {
     private var audioRestartInFlight = false
 
     /**
+     * 音轨是**我们自己**禁用掉的，且还没恢复。
+     *
+     * 关键：判断依据必须是这个本地标志，**绝不能读 `player.trackSelectionParameters`
+     * 反推**。实测（TCL m7642 / Android 9 / media3 1.11.1）恢复后读回来的
+     * `disabledTrackTypes` 仍可能含 audio，于是"幂等恢复"变成每 [AUDIO_WATCHDOG_INTERVAL_MS]
+     * 触发一次 disable/enable 死循环：每次都要重建 audio renderer、重新 configure sink，
+     * 表现为 1 倍速直通断续吞字、非 1 倍速没声音，最后 mediacodec 被反复抢光，
+     * 视频解码器也建不出来，弹「没有支持此媒体的解码器」。
+     */
+    private var audioTrackDisabledByUs = false
+    private var audioTrackDisabledAtMs = 0L
+
+    /** 本片源内已经重选过几次。超过 [AUDIO_RESELECT_MAX_PER_ITEM] 就放弃切换，保声音优先。 */
+    private var audioReselectCount = 0
+
+    /** [enforceAudioMode] 上次纠正的时间，防止看门狗与事件回调互相触发形成抖动。 */
+    private var audioEnforceAtMs = 0L
+
+    /**
      * 本片源的音轨在"强制解码"下被判为不支持过一次。
      *
      * 典型情形：用户把音频解码器钉在「软解+」而本机 E-AC3 只有厂商硬件解码器，
@@ -224,6 +243,20 @@ class PlayerService : MediaSessionService() {
                     "requestedAudio=${decoderManager.audioMode}, " +
                     "activeAudio=${decoderManager.activeAudioMode}: ${error.message}",
             )
+            // 本机 logcat 取不到应用日志，错误必须落盘，否则只能看到最终 UI 文案
+            AudioDiag.log(
+                "player error: code=${error.errorCodeName} track=${error.decoderTrackType()} " +
+                    "gate=${speedAudioFactory?.gateSink?.forceDecode} " +
+                    "actual=${speedAudioFactory?.gateSink?.isPassthrough} " +
+                    "reselects=$audioReselectCount speed=${mediaSession?.player?.playbackParameters?.speed}",
+            )
+            var cause: Throwable? = error.cause
+            var depth = 0
+            while (cause != null && depth < 5) {
+                AudioDiag.log("player error cause[$depth] ${cause.javaClass.simpleName}: ${cause.message}")
+                cause = cause.cause
+                depth++
+            }
         }
     }
 
@@ -246,6 +279,9 @@ class PlayerService : MediaSessionService() {
             // 新片源重新评估直通：上一部片源失败过的格式（DTS / TrueHD）不代表这部也失败
             speedAudioFactory?.gateSink?.clearDenylist()
             decodeBlockedForItem = false
+            audioReselectCount = 0
+            audioModeRetries = 0
+            audioTrackDisabledByUs = false
             restoreDecoderChoices(mediaItem)
             isMediaItemReady = false
             loadArtworkForCurrentMediaItem()
@@ -795,6 +831,9 @@ class PlayerService : MediaSessionService() {
         val speed = player.playbackParameters.speed
         val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
         if (sink.forceDecode == wantDecode) return
+        val now = SystemClock.uptimeMillis()
+        if (now - audioEnforceAtMs < AUDIO_ENFORCE_MIN_INTERVAL_MS) return
+        audioEnforceAtMs = now
         AudioDiag.log("audio mode: out of sync ($reason) gate=${sink.forceDecode} speed=$speed")
         updateSpeedAudioMode(speed, force = true)
     }
@@ -822,11 +861,20 @@ class PlayerService : MediaSessionService() {
     /** 禁用音轨类型逼渲染器重新选轨，并安排无条件恢复与事后校验。 */
     private fun doAudioReselect(reason: String) {
         val player = mediaSession?.player as? ExoPlayer ?: return
+        // 已经在重选中：再发一次只会让渲染器白重建一轮
+        if (audioTrackDisabledByUs) return
+        if (audioReselectCount >= AUDIO_RESELECT_MAX_PER_ITEM) {
+            AudioDiag.log("audio reselect: giving up after $audioReselectCount tries ($reason)")
+            return
+        }
+        audioReselectCount++
         val now = SystemClock.uptimeMillis()
         audioRestartInFlight = true
         audioReselectScheduledAtMs = now
         audioReselectAtMs = now
-        AudioDiag.log("audio reselect: disable audio track ($reason)")
+        audioTrackDisabledAtMs = now
+        audioTrackDisabledByUs = true
+        AudioDiag.log("audio reselect #$audioReselectCount: disable audio track ($reason)")
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
             .build()
@@ -838,10 +886,14 @@ class PlayerService : MediaSessionService() {
 
     private val restoreAudioTrackRunnable = Runnable { restoreAudioTrackType("timeout") }
 
-    /** 幂等恢复：只看 player 的实际参数，不看状态机怎么想。 */
+    /**
+     * 恢复音轨。**只认本地标志**，绝不读 player 读回来判断
+     * （原因见 [audioTrackDisabledByUs]：读回值不可信，会变成 disable/enable 死循环）。
+     */
     private fun restoreAudioTrackType(why: String) {
+        if (!audioTrackDisabledByUs) return
+        audioTrackDisabledByUs = false
         val player = mediaSession?.player as? ExoPlayer ?: return
-        if (C.TRACK_TYPE_AUDIO !in player.trackSelectionParameters.disabledTrackTypes) return
         AudioDiag.log("audio track restored ($why)")
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
@@ -890,11 +942,14 @@ class PlayerService : MediaSessionService() {
      */
     private val audioTrackWatchdog = object : Runnable {
         override fun run() {
-            val player = mediaSession?.player
-            if (player != null &&
-                SystemClock.uptimeMillis() - audioReselectAtMs > AUDIO_WATCHDOG_GRACE_MS
+            // 只在"我们自己禁用了且超时没恢复"时动手 —— 无条件恢复会变成死循环
+            if (audioTrackDisabledByUs &&
+                SystemClock.uptimeMillis() - audioTrackDisabledAtMs > AUDIO_WATCHDOG_GRACE_MS
             ) {
                 restoreAudioTrackType("watchdog")
+            }
+            // 重选过程中不要抢跑对齐，否则闸门被来回改
+            if (!audioTrackDisabledByUs && !audioRestartInFlight) {
                 enforceAudioMode("watchdog")
             }
             reselectHandler.postDelayed(this, AUDIO_WATCHDOG_INTERVAL_MS)
@@ -1349,6 +1404,18 @@ private const val AUDIO_WATCHDOG_INTERVAL_MS = 3000L
 
 /** 看门狗宽限：距上次重选超过这个时间仍处于禁用/错位状态就强行纠正。 */
 private const val AUDIO_WATCHDOG_GRACE_MS = 2500L
+
+/**
+ * 同一片源内最多重选几次。
+ *
+ * 每次重选都要销毁再重建 audio renderer（连带 mediacodec 抢占）。本机实测
+ * 两次以上就足以把 4K 视频解码器挤到初始化失败，弹出「没有支持此媒体的解码器」。
+ * 超过上限就放弃速度切换：宁可速度不生效，也要保证画面和声音都在。
+ */
+private const val AUDIO_RESELECT_MAX_PER_ITEM = 6
+
+/** [enforceAudioMode] 两次纠正之间的最小间隔，防止与看门狗互相触发形成抖动。 */
+private const val AUDIO_ENFORCE_MIN_INTERVAL_MS = 3000L
 
 @get:UnstableApi
 @set:UnstableApi
