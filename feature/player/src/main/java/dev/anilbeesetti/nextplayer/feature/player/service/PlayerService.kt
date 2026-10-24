@@ -803,13 +803,19 @@ class PlayerService : MediaSessionService() {
      */
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
+        val mime = selectedAudioMime()
+
+        // 只有"能被直通的压缩音轨"才需要按速度切管线。AAC / MP3 / FLAC / Opus 这些
+        // 本来就走 PCM，变速由处理器链里的 Sonic 完成，重选音轨只会白白重建一次
+        // 音频渲染器（听感上就是每次调速度都断一下），必须直接跳过。
+        if (!isPassthroughCandidate(mime)) {
+            sink.setForceDecode(false)
+            return
+        }
+
         val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
         val gateChanged = sink.setForceDecode(wantDecode)
         if (!gateChanged && !force) return
-
-        // PCM 片源永远不直通，也不需要重选（变速由处理器链里的 Sonic 直接完成）
-        val mime = selectedAudioMime() ?: return
-        if (mime == MimeTypes.AUDIO_RAW) return
 
         val wantPassthrough = !wantDecode
         if (!gateChanged && sink.isPassthrough == wantPassthrough) {
@@ -828,6 +834,10 @@ class PlayerService : MediaSessionService() {
     private fun enforceAudioMode(reason: String) {
         val sink = speedAudioFactory?.gateSink ?: return
         val player = mediaSession?.player ?: return
+        if (!isPassthroughCandidate(selectedAudioMime())) {
+            sink.setForceDecode(false)
+            return
+        }
         val speed = player.playbackParameters.speed
         val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
         if (sink.forceDecode == wantDecode) return
@@ -910,8 +920,7 @@ class PlayerService : MediaSessionService() {
         audioRestartInFlight = false
         restoreAudioTrackType("verify")
 
-        val mime = selectedAudioMime() ?: return@Runnable
-        if (mime == MimeTypes.AUDIO_RAW) return@Runnable
+        if (!isPassthroughCandidate(selectedAudioMime())) return@Runnable
         if (!player.isPlaying) return@Runnable
 
         val speed = player.playbackParameters.speed
@@ -960,6 +969,16 @@ class PlayerService : MediaSessionService() {
     private fun selectedAudioMime(): String? = mediaSession?.player?.currentTracks?.groups
         ?.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }
         ?.mediaTrackGroup?.getFormat(0)?.sampleMimeType
+
+    /**
+     * 这条源音轨是不是"能被直通的压缩格式"。
+     *
+     * 只有这类音轨才需要按速度在「直通 / 解码折叠」之间切换。其余格式（AAC、MP3、
+     * FLAC、Opus、Vorbis、PCM……）本来就是 PCM 出去，变速由 Sonic 完成，
+     * 对它们做音轨重选纯属自伤。
+     */
+    private fun isPassthroughCandidate(mime: String?): Boolean =
+        mime != null && mime in PASSTHROUGH_MIME_TYPES
 
     /** 当前解码器模式下能否解出这条音轨；解不了就不要拦直通（宁可速度不生效也不能静音）。 */
     private fun canDecodeSelectedAudio(): Boolean {
@@ -1416,6 +1435,22 @@ private const val AUDIO_RESELECT_MAX_PER_ITEM = 6
 
 /** [enforceAudioMode] 两次纠正之间的最小间隔，防止与看门狗互相触发形成抖动。 */
 private const val AUDIO_ENFORCE_MIN_INTERVAL_MS = 3000L
+
+/**
+ * 会被直通的压缩音频格式。
+ *
+ * 用字面量而不是 `MimeTypes` 常量：`AUDIO_E_AC3_JOC`、`AUDIO_AC4` 等常量在部分
+ * media3 版本里缺失或改名，写死字符串（与 mp4/mkv 提取器实际给出的 mime 一致）最稳。
+ */
+private val PASSTHROUGH_MIME_TYPES = setOf(
+    "audio/ac3",
+    "audio/eac3",
+    "audio/eac3-joc",
+    "audio/vnd.dts",
+    "audio/vnd.dts.hd",
+    "audio/true-hd",
+    "audio/ac4",
+)
 
 @get:UnstableApi
 @set:UnstableApi
