@@ -248,6 +248,9 @@ class PlayerService : MediaSessionService() {
                 "player error: code=${error.errorCodeName} track=${error.decoderTrackType()} " +
                     "gate=${speedAudioFactory?.gateSink?.forceDecode} " +
                     "actual=${speedAudioFactory?.gateSink?.isPassthrough} " +
+                    "requestedVideo=${decoderManager.videoMode} " +
+                    "activeVideo=${decoderManager.activeVideoMode} " +
+                    "requestedAudio=${decoderManager.audioMode} " +
                     "reselects=$audioReselectCount speed=${mediaSession?.player?.playbackParameters?.speed}",
             )
             var cause: Throwable? = error.cause
@@ -1206,7 +1209,8 @@ class PlayerService : MediaSessionService() {
     private fun retryDecoderWith(retry: DecoderRetry): Boolean {
         val player = mediaSession?.player as? ExoPlayer ?: return false
         val shouldPrepare = player.playerError != null
-        selectDecoder(retry.trackType, retry.mode)
+        // 自动降级不写回片源，避免一次偶发失败被永久保存
+        selectDecoder(retry.trackType, retry.mode, persist = false)
         if (shouldPrepare && player.mediaItemCount > 0) {
             player.prepare()
         }
@@ -1276,19 +1280,34 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    private fun selectDecoder(trackType: DecoderTrackType, mode: DecoderMode) {
+    /**
+     * 切换解码模式。
+     *
+     * [persist] 为 false 时只改 nextlib 侧的解码器选择，不把模式写回 MediaItem。
+     * 自动降级必须走这条路径：写回的话，一次偶发失败就会把「软解+」永久钉在这部片源上，
+     * 用户下次打开直接失败，看起来就是「第一次能播、之后再也播不了」。
+     */
+    private fun selectDecoder(
+        trackType: DecoderTrackType,
+        mode: DecoderMode,
+        persist: Boolean = true,
+    ) {
         when (trackType) {
             DecoderTrackType.VIDEO -> decoderManager.selectVideoDecoder(mode)
             DecoderTrackType.AUDIO -> decoderManager.selectAudioDecoder(mode)
         }
-        val player = mediaSession?.player
-        val mediaItem = player?.currentMediaItem
-        if (mediaItem != null) {
-            val updatedItem = when (trackType) {
-                DecoderTrackType.VIDEO -> mediaItem.copy(videoDecoderMode = mode)
-                DecoderTrackType.AUDIO -> mediaItem.copy(audioDecoderMode = mode)
+        if (persist) {
+            val player = mediaSession?.player
+            val mediaItem = player?.currentMediaItem
+            if (mediaItem != null) {
+                val updatedItem = when (trackType) {
+                    DecoderTrackType.VIDEO -> mediaItem.copy(videoDecoderMode = mode)
+                    DecoderTrackType.AUDIO -> mediaItem.copy(audioDecoderMode = mode)
+                }
+                player.replaceMediaItem(player.currentMediaItemIndex, updatedItem)
             }
-            player.replaceMediaItem(player.currentMediaItemIndex, updatedItem)
+        } else {
+            AudioDiag.log("decoder fallback: $trackType -> $mode (not persisted)")
         }
         publishDecoderState()
     }

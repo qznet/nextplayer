@@ -117,11 +117,18 @@ private class TrackRecovery {
     }
 }
 
+/**
+ * 解码失败后的降级顺序。
+ *
+ * 不能把 AUTO 直接降到 FFMPEG：FFmpeg 渲染器以前根本没加载（extensionRendererMode 默认 OFF），
+ * 降过去必然再失败一次，最终弹「没有支持此媒体的解码器可用」，用户从此再也放不了这部片。
+ * 正确做法是先把硬件以外的软件解码器试一遍，FFMPEG 只作为最后兜底。
+ */
 private fun DecoderMode.fallbackModes(): List<DecoderMode> {
     return when (this) {
-        DecoderMode.AUTO -> listOf(DecoderMode.FFMPEG)
+        DecoderMode.AUTO -> listOf(DecoderMode.HARDWARE, DecoderMode.SOFTWARE, DecoderMode.FFMPEG)
         DecoderMode.HARDWARE -> listOf(DecoderMode.SOFTWARE, DecoderMode.FFMPEG)
-        DecoderMode.SOFTWARE -> listOf(DecoderMode.FFMPEG)
+        DecoderMode.SOFTWARE -> listOf(DecoderMode.FFMPEG, DecoderMode.AUTO)
         DecoderMode.FFMPEG -> listOf(DecoderMode.AUTO)
     }
 }
