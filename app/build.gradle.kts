@@ -73,10 +73,23 @@ android {
 
             // 日常测试构建默认只出 armeabi-v7a（电视/盒子上用，编译快、产物少）。
             // 需要全量（正式 release，或明确指定）时传 -PnextplayerAbis=all。
+            //
+            // 注意：这里的名字必须是 ABI 全名（armeabi-v7a），别名 v7a/arm64 要先展开。
+            // 否则 include() 匹配不到任何 ABI，Gradle 会静默退化成一个含全部 ABI 的
+            // 无后缀包（踩过：-PnextplayerAbis=v7a 实际出了 53MB 全量包）。
+            val abiAliases = mapOf(
+                "v7a" to "armeabi-v7a",
+                "arm32" to "armeabi-v7a",
+                "armeabi" to "armeabi-v7a",
+                "arm64" to "arm64-v8a",
+                "arm64v8a" to "arm64-v8a",
+                "x64" to "x86_64",
+            )
             val requested = (providers.gradleProperty("nextplayerAbis").orNull ?: "v7a")
                 .split(',')
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
+                .map { abiAliases[it.lowercase()] ?: it }
             val buildAll = requested.isEmpty() || requested.any { it.equals("all", true) } || requested.size > 1
             val selected = if (buildAll) {
                 listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
