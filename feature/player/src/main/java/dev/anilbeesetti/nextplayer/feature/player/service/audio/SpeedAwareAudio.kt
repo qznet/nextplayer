@@ -6,7 +6,6 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
-import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
 import androidx.media3.common.C
@@ -19,9 +18,6 @@ import androidx.media3.exoplayer.audio.AudioCapabilities
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.ForwardingAudioSink
-import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
-import androidx.media3.exoplayer.mediacodec.MediaCodecInfo as ExoMediaCodecInfo
-import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderMode
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
@@ -129,6 +125,25 @@ class PassthroughGateAudioSink(
     var isPassthrough: Boolean = false
         private set
 
+    /** 最近一次 configure 收到的 mime：判"这条音轨本来能不能直通"只看实测值。 */
+    @Volatile
+    var lastConfiguredMime: String? = null
+        private set
+
+    /**
+     * 这条片源是否出现过压缩格式的 configure。
+     *
+     * 有 = 它本来能被直通，调速度时才值得重选音轨。
+     * 没有 = AAC / FLAC / Opus 这类本来就是 PCM 出去的片源，变速由 Sonic 完成，
+     * 重选只会白重建渲染器。
+     *
+     * 不能用 `currentTracks` 的 mime 判断：实测在重选、渲染器重建期间它会是 null 或
+     * 已被改成 audio/raw，据此判断会把闸门自己关掉，表现为"调速度功放完全不变"。
+     */
+    @Volatile
+    var passthroughEverSeen: Boolean = false
+        private set
+
     /** 闸门当前期望值（true = 强制解码）。调用方据此判断是否已对齐，不必依赖增量回调。 */
     val forceDecode: Boolean
         get() = mode.forceDecode
@@ -137,6 +152,8 @@ class PassthroughGateAudioSink(
         val format = audioSinkConfig.format
         val mimeType = format.sampleMimeType
         isPassthrough = mimeType != null && mimeType != MimeTypes.AUDIO_RAW
+        lastConfiguredMime = mimeType
+        if (isPassthrough) passthroughEverSeen = true
         AudioDiag.log(
             "sink.configure: mime=$mimeType ch=${format.channelCount} " +
                 "rate=${format.sampleRate} pcm=${format.pcmEncoding} " +
@@ -449,19 +466,11 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         // 选「软解+」时 DecoderMediaCodecSelector 返回空列表、FfmpegVideoRenderer 又不在
         // 渲染器列表里，必然报「没有支持此媒体的解码器可用」。这里打开它，让软解真能用。
         setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
-        // 本机 OMX.MS.DOLBY_VISION.Decoder 第一次能播、之后每次 configure 或 start 都失败
-        // （ExoPlayer 侧表现为 Decoder failed + IllegalStateException），而同一文件用
-        // 系统 HEVC 解码器路径可正常出画。所以把 Dolby Vision 强制交给 HEVC 解码器。
-        setMediaCodecSelector(DolbyVisionHevcSelector(MediaCodecSelector.DEFAULT))
+        // 注意：Dolby Vision **必须**交给系统 DV 解码器（OMX.MS.DOLBY_VISION.Decoder）。
+        // 曾试过把 video/dolby-vision 改投 HEVC 解码器，结果画面严重偏绿/发灰 ——
+        // DV Profile 5 的码流是 IPTPQc2 色彩编码，只有 DV 解码器会做颜色转换，
+        // 普通 HEVC 解码器按 YCbCr 解释必然偏色。已回滚，不要再改。
     }
-
-    /**
-     * 解码器已经换成 HEVC 组件，MediaFormat 的 mime 必须同步改掉（见
-     * [DolbyVisionHevcAdapterFactory]）。`DefaultRenderersFactory` 没有 setter，
-     * 但把 `codecAdapterFactory` 暴露成 protected getter，覆盖它即可。
-     */
-    override fun getCodecAdapterFactory(): MediaCodecAdapter.Factory =
-        DolbyVisionHevcAdapterFactory(super.getCodecAdapterFactory())
 
     override fun buildAudioSink(
         context: Context,
@@ -487,87 +496,6 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
     }
 
     private var sinkBuildCount = 0
-}
-
-/**
- * 把 Dolby Vision 交给 HEVC 解码器。
- *
- * 本机（TCL m7642 / Android 9）实测：`OMX.MS.DOLBY_VISION.Decoder` 能成功播放一次，
- * 之后再播放同一文件必然在 start 阶段抛 `IllegalStateException`（ExoPlayer 报告
- * `Decoder failed: OMX.MS.DOLBY_VISION.Decoder`），进程重启也不恢复；同一文件用
- * 系统 HEVC 解码器路径（JustPlus 等应用）可以稳定播放。DV Profile 5/8 的码流本身就是
- * HEVC 主层 + RPU 元数据，交给 HEVC 硬解是各家播放器的常见做法。
- *
- * 只改 Dolby Vision，其它格式原样透传给 [delegate]，不改变既有解码器选择行为。
- */
-@UnstableApi
-internal class DolbyVisionHevcSelector(
-    private val delegate: MediaCodecSelector = MediaCodecSelector.DEFAULT,
-) : MediaCodecSelector {
-
-    override fun getDecoderInfos(
-        mimeType: String,
-        requiresSecureDecoder: Boolean,
-        requiresTunnelingDecoder: Boolean,
-    ): List<ExoMediaCodecInfo> {
-        if (mimeType != MimeTypes.VIDEO_DOLBY_VISION) {
-            return delegate.getDecoderInfos(
-                mimeType,
-                requiresSecureDecoder,
-                requiresTunnelingDecoder,
-            )
-        }
-        val hevc = runCatching {
-            delegate.getDecoderInfos(
-                MimeTypes.VIDEO_H265,
-                requiresSecureDecoder,
-                requiresTunnelingDecoder,
-            )
-        }.getOrNull()
-        if (!hevc.isNullOrEmpty()) {
-            AudioDiag.log("dv->hevc: using ${hevc.first().name} for $mimeType")
-            return hevc
-        }
-        AudioDiag.log("dv->hevc: no HEVC decoder for $mimeType, keep DV decoder")
-        return delegate.getDecoderInfos(
-            mimeType,
-            requiresSecureDecoder,
-            requiresTunnelingDecoder,
-        )
-    }
-}
-
-/**
- * 配合 [DolbyVisionHevcSelector]：解码器已经换成 HEVC 组件，MediaFormat 的 mime 必须同步改掉，
- * 否则 OMX 组件收到 `video/dolby-vision` 会拒绝配置。CSD（hvcC）原样保留，
- * 所以 HEVC 主层能正常解出，RPU 元数据随码流一并送入。
- */
-@UnstableApi
-internal class DolbyVisionHevcAdapterFactory(
-    private val delegate: MediaCodecAdapter.Factory,
-) : MediaCodecAdapter.Factory {
-
-    override fun createAdapter(configuration: MediaCodecAdapter.Configuration): MediaCodecAdapter {
-        val mediaFormat = configuration.mediaFormat
-        val mime = runCatching { mediaFormat.getString(MediaFormat.KEY_MIME) }.getOrNull()
-        if (mime == MimeTypes.VIDEO_DOLBY_VISION) {
-            runCatching { mediaFormat.setString(MediaFormat.KEY_MIME, MimeTypes.VIDEO_H265) }
-                .onFailure { AudioDiag.log("dv->hevc: rewrite mime failed: $it") }
-            AudioDiag.log(
-                "dv->hevc: configuring ${configuration.codecInfo.name} as HEVC " +
-                    "(${configuration.format.width}x${configuration.format.height})",
-            )
-            val rewritten = MediaCodecAdapter.Configuration.createForVideoDecoding(
-                configuration.codecInfo,
-                mediaFormat,
-                configuration.format,
-                configuration.surface,
-                configuration.crypto,
-            )
-            return delegate.createAdapter(rewritten)
-        }
-        return delegate.createAdapter(configuration)
-    }
 }
 
 /**

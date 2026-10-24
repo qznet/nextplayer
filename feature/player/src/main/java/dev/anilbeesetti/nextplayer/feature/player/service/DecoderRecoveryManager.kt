@@ -118,17 +118,23 @@ private class TrackRecovery {
 }
 
 /**
- * 解码失败后的降级顺序。
+ * 解码失败后的降级顺序：**一次只降一级**。
  *
- * 不能把 AUTO 直接降到 FFMPEG：FFmpeg 渲染器以前根本没加载（extensionRendererMode 默认 OFF），
- * 降过去必然再失败一次，最终弹「没有支持此媒体的解码器可用」，用户从此再也放不了这部片。
- * 正确做法是先把硬件以外的软件解码器试一遍，FFMPEG 只作为最后兜底。
+ * 历史教训（TCL m7642 / Android 9 实测）：原来 AUTO 会一口气连试
+ * HARDWARE → SOFTWARE → FFMPEG，同一部 4K 片源在 3 秒内被重建 3 次解码器。
+ * 本机的 4K 硬解组件（`OMX.MS.DOLBY_VISION.Decoder` / `OMX.MS.HEVC.Decoder`）
+ * 连续 configure/start 几次之后会彻底起不来 —— 之后连第一次播放都黑屏，
+ * 只能重启电视恢复。
+ *
+ * 所以：AUTO 失败后直接给 SOFTWARE（AUTO 本来就包含硬解，再降 HARDWARE 等于
+ * 对同一个硬解器再打一枪），每个片源最多两次尝试。宁可让用户手动换解码器，
+ * 也不能把系统解码器打废。
  */
 private fun DecoderMode.fallbackModes(): List<DecoderMode> {
     return when (this) {
-        DecoderMode.AUTO -> listOf(DecoderMode.HARDWARE, DecoderMode.SOFTWARE, DecoderMode.FFMPEG)
-        DecoderMode.HARDWARE -> listOf(DecoderMode.SOFTWARE, DecoderMode.FFMPEG)
-        DecoderMode.SOFTWARE -> listOf(DecoderMode.FFMPEG, DecoderMode.AUTO)
-        DecoderMode.FFMPEG -> listOf(DecoderMode.AUTO)
+        DecoderMode.AUTO -> listOf(DecoderMode.SOFTWARE)
+        DecoderMode.HARDWARE -> listOf(DecoderMode.SOFTWARE)
+        DecoderMode.SOFTWARE -> listOf(DecoderMode.FFMPEG)
+        DecoderMode.FFMPEG -> emptyList()
     }
 }

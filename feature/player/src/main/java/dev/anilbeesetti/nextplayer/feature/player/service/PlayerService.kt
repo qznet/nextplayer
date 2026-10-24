@@ -806,12 +806,10 @@ class PlayerService : MediaSessionService() {
      */
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
-        val mime = selectedAudioMime()
 
-        // 只有"能被直通的压缩音轨"才需要按速度切管线。AAC / MP3 / FLAC / Opus 这些
-        // 本来就走 PCM，变速由处理器链里的 Sonic 完成，重选音轨只会白白重建一次
-        // 音频渲染器（听感上就是每次调速度都断一下），必须直接跳过。
-        if (!isPassthroughCandidate(mime)) {
+        // PCM 源（AAC / MP3 / FLAC / Opus…）本来就是 PCM 出去，变速由 Sonic 完成，
+        // 重选音轨只会白重建一次音频渲染器（听感上就是每次调速度都断一下）。
+        if (!shouldManageAudioPipeline()) {
             sink.setForceDecode(false)
             return
         }
@@ -837,7 +835,9 @@ class PlayerService : MediaSessionService() {
     private fun enforceAudioMode(reason: String) {
         val sink = speedAudioFactory?.gateSink ?: return
         val player = mediaSession?.player ?: return
-        if (!isPassthroughCandidate(selectedAudioMime())) {
+        // 重选进行中不要抢跑：此刻闸门本来就可能与渲染器状态错位，纠正只会打架
+        if (audioTrackDisabledByUs || audioRestartInFlight) return
+        if (!shouldManageAudioPipeline()) {
             sink.setForceDecode(false)
             return
         }
@@ -854,7 +854,10 @@ class PlayerService : MediaSessionService() {
     private fun requestAudioReselect(reason: String) {
         val player = mediaSession?.player as? ExoPlayer ?: return
         if (player.playbackState != Player.STATE_READY) {
-            AudioDiag.log("reselect skipped (state=${player.playbackState}): $reason")
+            // 不能丢请求：用户常在缓冲/暂停时切速度，丢了就变成"这次调速没反应"
+            AudioDiag.log("reselect deferred (state=${player.playbackState}): $reason")
+            reselectHandler.removeCallbacks(audioReselectRunnable)
+            reselectHandler.postDelayed(audioReselectRunnable, AUDIO_RESELECT_RETRY_MS)
             return
         }
         val now = SystemClock.uptimeMillis()
@@ -869,7 +872,22 @@ class PlayerService : MediaSessionService() {
         doAudioReselect(reason)
     }
 
-    private val audioReselectRunnable = Runnable { doAudioReselect("deferred") }
+    /**
+     * 延迟到期的重选：**执行前再确认一次意图**。
+     *
+     * 排队期间用户可能已经把速度切回去了（1.0 → 1.1 → 1.0）。若不加这一步，
+     * 就会看到"先切成立体声、马上又切回透传"这种延迟一拍的怪现象。
+     */
+    private val audioReselectRunnable = Runnable {
+        val sink = speedAudioFactory?.gateSink ?: return@Runnable
+        val player = mediaSession?.player ?: return@Runnable
+        val wantDecode = abs(player.playbackParameters.speed - 1f) > SPEED_UNITY_EPSILON
+        if (sink.forceDecode == wantDecode && sink.isPassthrough != wantDecode) {
+            AudioDiag.log("reselect dropped: already satisfied (gate=$wantDecode)")
+            return@Runnable
+        }
+        requestAudioReselect("deferred")
+    }
 
     /** 禁用音轨类型逼渲染器重新选轨，并安排无条件恢复与事后校验。 */
     private fun doAudioReselect(reason: String) {
@@ -923,7 +941,7 @@ class PlayerService : MediaSessionService() {
         audioRestartInFlight = false
         restoreAudioTrackType("verify")
 
-        if (!isPassthroughCandidate(selectedAudioMime())) return@Runnable
+        if (!shouldManageAudioPipeline()) return@Runnable
         if (!player.isPlaying) return@Runnable
 
         val speed = player.playbackParameters.speed
@@ -968,20 +986,38 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    /** 当前选中音频轨的 mime；没有选中音轨时返回 null。 */
-    private fun selectedAudioMime(): String? = mediaSession?.player?.currentTracks?.groups
-        ?.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }
-        ?.mediaTrackGroup?.getFormat(0)?.sampleMimeType
+    /**
+     * 当前音频轨的**源**格式 mime。
+     *
+     * 优先取选中轨；`isSelected` 在音轨重选、渲染器重建的瞬间可能是 false，
+     * 这时退回"第一个音频组"，避免把"暂时读不到"误判成"这不是压缩音轨"。
+     */
+    private fun selectedAudioMime(): String? {
+        val groups = mediaSession?.player?.currentTracks?.groups
+            ?.filter { it.type == C.TRACK_TYPE_AUDIO }
+            .orEmpty()
+        if (groups.isEmpty()) return null
+        val group = groups.firstOrNull { it.isSelected } ?: groups.first()
+        return group.mediaTrackGroup.getFormat(0).sampleMimeType
+    }
 
     /**
-     * 这条源音轨是不是"能被直通的压缩格式"。
+     * 这条片源是否值得按速度在「直通 / 解码折叠」之间切换。
      *
-     * 只有这类音轨才需要按速度在「直通 / 解码折叠」之间切换。其余格式（AAC、MP3、
-     * FLAC、Opus、Vorbis、PCM……）本来就是 PCM 出去，变速由 Sonic 完成，
-     * 对它们做音轨重选纯属自伤。
+     * 判据以**实测值为主、源格式为辅**：
+     * 1. 音频 sink 曾经以压缩格式 configure 过（`passthroughEverSeen`）
+     *    或此刻正在直通 —— 说明这条片源本来能直通；
+     * 2. 否则看源音轨 mime 是否压缩格式；读不到就**当作不需要**，绝不当成"必须关闸门"。
+     *
+     * 之前用 `currentTracks` 的 mime 单点判断，在重选期间读到 null 就把闸门关掉，
+     * 表现就是"调速度功放完全不变"；反过来若读到 audio/raw 则永远不切。
      */
-    private fun isPassthroughCandidate(mime: String?): Boolean =
-        mime != null && mime in PASSTHROUGH_MIME_TYPES
+    private fun shouldManageAudioPipeline(): Boolean {
+        val sink = speedAudioFactory?.gateSink ?: return false
+        if (sink.passthroughEverSeen || sink.isPassthrough) return true
+        val mime = selectedAudioMime() ?: return false
+        return mime in PASSTHROUGH_MIME_TYPES
+    }
 
     /** 当前解码器模式下能否解出这条音轨；解不了就不要拦直通（宁可速度不生效也不能静音）。 */
     private fun canDecodeSelectedAudio(): Boolean {
@@ -1089,6 +1125,11 @@ class PlayerService : MediaSessionService() {
             }
             player.clearMediaItems()
             player.stop()
+            // 主动解绑视频输出：本机 4K 硬解组件（OMX.MS.DOLBY_VISION / HEVC）是单实例，
+            // 上面 stop() 只是停播放，解码器释放可能拖到 service 真正销毁才发生。
+            // 用户"退出后马上再播"就会撞上旧解码器没释放，start 阶段直接失败。
+            runCatching { player.clearVideoSurface() }
+                .onFailure { AudioDiag.log("clearVideoSurface failed: $it") }
         }
         stopSelf()
     }
@@ -1437,7 +1478,10 @@ private const val DECODER_LOG_TAG = "Decoder"
 private const val SPEED_UNITY_EPSILON = 0.005f
 
 /** 两次管线切换之间的最小间隔，避免连按上下键时反复重选打断声音。 */
-private const val AUDIO_MODE_MIN_INTERVAL_MS = 900L
+private const val AUDIO_MODE_MIN_INTERVAL_MS = 500L
+
+/** 播放器还没到 READY 时，重选请求延后这么久再试（不能直接丢弃）。 */
+private const val AUDIO_RESELECT_RETRY_MS = 400L
 
 /**
  * 禁用音轨后多久**无条件**恢复。
@@ -1472,7 +1516,7 @@ private const val AUDIO_WATCHDOG_GRACE_MS = 2500L
 private const val AUDIO_RESELECT_MAX_PER_ITEM = 6
 
 /** [enforceAudioMode] 两次纠正之间的最小间隔，防止与看门狗互相触发形成抖动。 */
-private const val AUDIO_ENFORCE_MIN_INTERVAL_MS = 3000L
+private const val AUDIO_ENFORCE_MIN_INTERVAL_MS = 1500L
 
 /**
  * 会被直通的压缩音频格式。
