@@ -77,7 +77,9 @@ import dev.anilbeesetti.nextplayer.feature.player.extensions.videoDecoderMode
 import dev.anilbeesetti.nextplayer.feature.player.extensions.videoZoom
 import dev.anilbeesetti.nextplayer.feature.player.extensions.withExternalAudio
 import dev.anilbeesetti.nextplayer.feature.player.model.DecoderTrackType
+import dev.anilbeesetti.nextplayer.feature.player.service.audio.AudioDiag
 import dev.anilbeesetti.nextplayer.feature.player.service.audio.SpeedAwareRenderersFactory
+import dev.anilbeesetti.nextplayer.feature.player.service.audio.canDecodeAudioMime
 import dev.anilbeesetti.nextplayer.feature.player.utils.isExplicitPlaylistItem
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderManager
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderMode
@@ -133,13 +135,22 @@ class PlayerService : MediaSessionService() {
     private val reselectHandler = Handler(Looper.getMainLooper())
     private val decoderRecoveryManager = DecoderRecoveryManager()
 
-    // 音频管线切换（直通 <-> 解码）的状态。切换是一次异步重选：禁用音轨 -> 等
-    // onTracksChanged -> 恢复音轨 -> 延迟校验实际状态，不成立就重试。
-    private var audioModePending = false
-    private var audioModePendingSpeed = 1f
+    // 音频管线切换（直通 <-> 解码）的状态。
+    // 重选 = 临时禁用音轨类型，随后**必定**恢复（见 updateSpeedAudioMode 注释：
+    // 恢复不能依赖 onTracksChanged，否则会永久静音）。
     private var audioModeRetries = 0
-    private var audioModeSwitchMs = 0L
+    private var audioReselectAtMs = 0L
+    private var audioReselectScheduledAtMs = 0L
     private var audioRestartInFlight = false
+
+    /**
+     * 本片源的音轨在"强制解码"下被判为不支持过一次。
+     *
+     * 典型情形：用户把音频解码器钉在「软解+」而本机 E-AC3 只有厂商硬件解码器，
+     * 非 1 倍速时闸门拦掉直通 → 没有可用解码器 → 音轨被判不支持 → 弹解码器错误且静音。
+     * 置位后本片源不再强制解码（速度对直通轨不生效，但至少有声音），换片源时复位。
+     */
+    private var decodeBlockedForItem = false
 
     private val decoderAnalyticsListener = object : AnalyticsListener {
         override fun onEvents(player: Player, events: AnalyticsListener.Events) {
@@ -232,6 +243,9 @@ class PlayerService : MediaSessionService() {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             super.onMediaItemTransition(mediaItem, reason)
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) return
+            // 新片源重新评估直通：上一部片源失败过的格式（DTS / TrueHD）不代表这部也失败
+            speedAudioFactory?.gateSink?.clearDenylist()
+            decodeBlockedForItem = false
             restoreDecoderChoices(mediaItem)
             isMediaItemReady = false
             loadArtworkForCurrentMediaItem()
@@ -291,9 +305,17 @@ class PlayerService : MediaSessionService() {
 
         override fun onTracksChanged(tracks: Tracks) {
             super.onTracksChanged(tracks)
-            // 我们自己禁用音轨引发的轨道变化：恢复音轨、补上速度、安排校验。
-            // 这一次变化不代表用户换了片源，所以不再往下走其余逻辑。
-            if (handleAudioReselectTracksChanged()) return
+            // 我们自己禁用音轨引发的轨道变化：立刻恢复（幂等）并只安排事后校验。
+            // 这次变化不代表用户换了片源，也不能拿它去判断"解码器不支持"——
+            // 音轨刚被我们禁用时是 unselected 的，判成不支持会误报解码失败。
+            if (audioRestartInFlight) {
+                audioRestartInFlight = false
+                restoreAudioTrackType("tracks changed")
+                reselectHandler.removeCallbacks(restoreAudioTrackRunnable)
+                reselectHandler.removeCallbacks(audioModeVerifyRunnable)
+                reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
+                return
+            }
             serviceScope.launch {
                 mediaSession?.player?.currentTracks?.let(::handleUnsupportedTracks)
             }
@@ -366,6 +388,14 @@ class PlayerService : MediaSessionService() {
             if (shouldResetTrackSelectionParameters) {
                 mediaSession?.player?.trackSelectionParameters = TrackSelectionParameters.DEFAULT
             }
+
+            if (playbackState == Player.STATE_READY) {
+                // 切片或重播就绪后按当前速度重新对齐闸门：速度回调可能压根没来过
+                reselectHandler.postDelayed(
+                    { enforceAudioMode("state ready") },
+                    AUDIO_MODE_ALIGN_DELAY_MS,
+                )
+            }
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -424,6 +454,7 @@ class PlayerService : MediaSessionService() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             super.onIsPlayingChanged(isPlaying)
+            if (isPlaying) enforceAudioMode("is playing")
             mediaSession?.run {
                 serviceScope.launch {
                     mediaRepository.updateMediumPosition(
@@ -716,150 +747,170 @@ class PlayerService : MediaSessionService() {
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
     /**
-     * 播放速度跨过 1 倍时切换音频管线：
-     * 1 倍速把压缩音轨（AC3 / E-AC3）直通给功放，其它速度解码成 PCM 并折叠 2 声道。
+     * 按播放速度对齐音频管线：1 倍速直通压缩音轨（AC3 / E-AC3），其它速度解码 + 折叠 2 声道。
      *
      * 光改闸门不够。media3 不会因为变速重新决策"直通还是解码"——
      * `MediaCodecAudioRenderer.setPlaybackParameters` 只是把参数转发给 `AudioSink`
-     * （已用 1.11.1 字节码确认），渲染器不会重建解码器。所以必须把音轨类型禁用再恢复，
-     * 让音频渲染器重新选轨、`shouldUseBypass` 按新闸门重算。
+     * （已用 1.11.1 字节码确认），渲染器不会重建解码器。必须让音频渲染器重新选轨，
+     * `shouldUseBypass` 才会按新闸门重算。
      *
-     * 这里用 [Player.Listener.onTracksChanged] 当"重选完成"的信号，而不是定时盲等；
-     * 完成后 [AUDIO_MODE_VERIFY_DELAY_MS] 再校验一次**实际**状态
-     * （[PassthroughGateAudioSink.isPassthrough]），不符就重试，最多 [AUDIO_MODE_MAX_RETRIES] 次。
-     * 这套闭环照 JustPlus.Player（com.brouken.player.PlayerActivity）的做法，比开环等待可靠。
+     * 重选手段是临时禁用音轨类型。**恢复绝不能依赖 `onTracksChanged`**：
+     * 目标机（TCL m7642 / Android 9）实测出现过回调不来、`currentTracks` 的 selected
+     * 标志也没及时更新，结果音轨永久停在 disabled —— 表现就是"画面在走、没有声音，
+     * 1 倍速也一直是立体声 PCM"。所以这里改成三道保险，且全部幂等：
+     * 1. 禁用后固定 [AUDIO_RESELECT_RESTORE_MS] 无条件恢复；
+     * 2. `onTracksChanged` 来了就提前恢复；
+     * 3. [audioTrackWatchdog] 每 [AUDIO_WATCHDOG_INTERVAL_MS] 兜底检查。
+     *
+     * 另外速度回调本身也可能漏（播放器重建后 speed 回到 1.0 而闸门还停在解码态），
+     * 所以还有 [enforceAudioMode] 在关键时机按当前 speed 强制对齐。
      */
-    private fun updateSpeedAudioMode(speed: Float) {
+    private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
-        val player = mediaSession?.player as? ExoPlayer ?: return
+        val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
+        val gateChanged = sink.setForceDecode(wantDecode)
+        if (!gateChanged && !force) return
 
-        val wantPassthrough = abs(speed - 1f) <= SPEED_UNITY_EPSILON
-        // 闸门同值说明还停在同一侧，管线不用动
-        if (!sink.setForceDecode(!wantPassthrough)) return
-        // 实际状态已经等于目标态（例如片源本身是 PCM），不必重选
-        if (sink.isPassthrough == wantPassthrough) {
-            audioModePending = false
-            Logger.logInfo(
-                AUDIO_LOG_TAG,
-                "audio mode: already ${audioModeName(wantPassthrough)} at $speed",
-            )
+        // PCM 片源永远不直通，也不需要重选（变速由处理器链里的 Sonic 直接完成）
+        val mime = selectedAudioMime() ?: return
+        if (mime == MimeTypes.AUDIO_RAW) return
+
+        val wantPassthrough = !wantDecode
+        if (!gateChanged && sink.isPassthrough == wantPassthrough) {
+            audioModeRetries = 0
             return
         }
-
-        audioModeRetries = 0
-        audioModePending = true
-        audioModePendingSpeed = speed
-        Logger.logInfo(
-            AUDIO_LOG_TAG,
-            "audio mode: switching to ${audioModeName(wantPassthrough)} at $speed " +
-                "(playing=${player.isPlaying})",
+        AudioDiag.log(
+            "audio mode: want ${audioModeName(wantPassthrough)} at $speed " +
+                "(gateChanged=$gateChanged actual=${audioModeName(sink.isPassthrough)})",
         )
-
-        // 没在播放：等真正开播时的 onTracksChanged 再补速度，避免停着反复重选
-        if (!player.isPlaying) return
-
-        val now = SystemClock.uptimeMillis()
-        val sinceLast = now - audioModeSwitchMs
-        if (sinceLast < AUDIO_MODE_MIN_INTERVAL_MS) {
-            // 连按上下键时把重选延后到最小间隔之后，避免一路重选把声音打断
-            val delay = AUDIO_MODE_MIN_INTERVAL_MS - sinceLast
-            reselectHandler.removeCallbacks(audioModeReselectRunnable)
-            reselectHandler.postDelayed(audioModeReselectRunnable, delay)
-            Logger.logInfo(AUDIO_LOG_TAG, "audio mode: reselect in ${delay}ms")
-            return
-        }
-        reselectAudioTrackForMode()
+        audioModeRetries = 0
+        requestAudioReselect("speed=$speed")
     }
 
-    private val audioModeReselectRunnable = Runnable { reselectAudioTrackForMode() }
+    /** 事件驱动对齐：任何时刻发现闸门与当前速度不符就纠正，不依赖速度回调是否来过。 */
+    private fun enforceAudioMode(reason: String) {
+        val sink = speedAudioFactory?.gateSink ?: return
+        val player = mediaSession?.player ?: return
+        val speed = player.playbackParameters.speed
+        val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
+        if (sink.forceDecode == wantDecode) return
+        AudioDiag.log("audio mode: out of sync ($reason) gate=${sink.forceDecode} speed=$speed")
+        updateSpeedAudioMode(speed, force = true)
+    }
 
-    /** 禁用音轨类型逼渲染器重新选轨；结果由 [handleAudioReselectTracksChanged] 接手。 */
-    private fun reselectAudioTrackForMode() {
-        if (audioRestartInFlight) return
+    private fun requestAudioReselect(reason: String) {
         val player = mediaSession?.player as? ExoPlayer ?: return
+        if (player.playbackState != Player.STATE_READY) {
+            AudioDiag.log("reselect skipped (state=${player.playbackState}): $reason")
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        val sinceLast = now - audioReselectScheduledAtMs
+        if (sinceLast in 0 until AUDIO_MODE_MIN_INTERVAL_MS) {
+            val delay = AUDIO_MODE_MIN_INTERVAL_MS - sinceLast
+            reselectHandler.removeCallbacks(audioReselectRunnable)
+            reselectHandler.postDelayed(audioReselectRunnable, delay)
+            AudioDiag.log("reselect deferred ${delay}ms: $reason")
+            return
+        }
+        doAudioReselect(reason)
+    }
+
+    private val audioReselectRunnable = Runnable { doAudioReselect("deferred") }
+
+    /** 禁用音轨类型逼渲染器重新选轨，并安排无条件恢复与事后校验。 */
+    private fun doAudioReselect(reason: String) {
+        val player = mediaSession?.player as? ExoPlayer ?: return
+        val now = SystemClock.uptimeMillis()
         audioRestartInFlight = true
-        audioModeSwitchMs = SystemClock.uptimeMillis()
-        Logger.logInfo(AUDIO_LOG_TAG, "audio mode: reselect")
+        audioReselectScheduledAtMs = now
+        audioReselectAtMs = now
+        AudioDiag.log("audio reselect: disable audio track ($reason)")
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
             .build()
+        reselectHandler.removeCallbacks(restoreAudioTrackRunnable)
+        reselectHandler.postDelayed(restoreAudioTrackRunnable, AUDIO_RESELECT_RESTORE_MS)
+        reselectHandler.removeCallbacks(audioModeVerifyRunnable)
+        reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
     }
 
-    /**
-     * @return true 表示这次轨道变化是我们自己引起的重选，调用方应跳过其余处理。
-     */
-    private fun handleAudioReselectTracksChanged(): Boolean {
-        if (!audioRestartInFlight) return false
-        audioRestartInFlight = false
-        val player = mediaSession?.player as? ExoPlayer ?: return true
-        Logger.logInfo(AUDIO_LOG_TAG, "audio reselect: restore")
+    private val restoreAudioTrackRunnable = Runnable { restoreAudioTrackType("timeout") }
+
+    /** 幂等恢复：只看 player 的实际参数，不看状态机怎么想。 */
+    private fun restoreAudioTrackType(why: String) {
+        val player = mediaSession?.player as? ExoPlayer ?: return
+        if (C.TRACK_TYPE_AUDIO !in player.trackSelectionParameters.disabledTrackTypes) return
+        AudioDiag.log("audio track restored ($why)")
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
             .build()
-        if (audioModePending) {
-            audioModePending = false
-            Logger.logInfo(AUDIO_LOG_TAG, "audio mode: rate $audioModePendingSpeed after reselect")
-            player.playbackParameters = PlaybackParameters(audioModePendingSpeed)
-        }
-        reselectHandler.removeCallbacks(audioModeVerifyRunnable)
-        reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
-        return true
     }
 
     /**
-     * 校验实际音频管线是否符合当前速度的要求，不符则重试。
-     *
-     * 只在选中音轨是压缩格式时才有意义：PCM 片源永远不会直通，
-     * 拿它去比对会白重试两次（JustPlus 同样先看 selected mime）。
+     * 事后校验：实际管线与速度要求不符就重试，最多 [AUDIO_MODE_MAX_RETRIES] 次。
+     * 无论结论如何，先把音轨恢复掉，避免静音。
      */
     private val audioModeVerifyRunnable = Runnable {
         val sink = speedAudioFactory?.gateSink ?: return@Runnable
         val player = mediaSession?.player ?: return@Runnable
+        audioRestartInFlight = false
+        restoreAudioTrackType("verify")
 
-        if (audioRestartInFlight) {
-            // onTracksChanged 一直没来，音轨可能还挂在被禁用的状态，强行恢复再试一次
-            Logger.logInfo(AUDIO_LOG_TAG, "audio mode: reselect never reported, releasing it")
-            audioRestartInFlight = false
-            if (!player.currentTracks.isTypeSelected(C.TRACK_TYPE_AUDIO)) {
-                (player as? ExoPlayer)?.let { exoPlayer ->
-                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                        .buildUpon()
-                        .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
-                        .build()
-                }
-            }
-            reselectHandler.removeCallbacks(audioModeReselectRunnable)
-            reselectHandler.postDelayed(audioModeReselectRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
-            return@Runnable
-        }
-
-        val selectedMime = player.currentTracks.groups
-            .filter { it.type == C.TRACK_TYPE_AUDIO }
-            .firstOrNull { it.isSelected }
-            ?.mediaTrackGroup?.getFormat(0)?.sampleMimeType
-        if (selectedMime == null || selectedMime == MimeTypes.AUDIO_RAW) return@Runnable
+        val mime = selectedAudioMime() ?: return@Runnable
+        if (mime == MimeTypes.AUDIO_RAW) return@Runnable
+        if (!player.isPlaying) return@Runnable
 
         val speed = player.playbackParameters.speed
         val wantPassthrough = abs(speed - 1f) <= SPEED_UNITY_EPSILON
-        if (sink.isPassthrough == wantPassthrough || !player.isPlaying) return@Runnable
-
+        if (sink.isPassthrough == wantPassthrough) {
+            audioModeRetries = 0
+            AudioDiag.log("audio mode: verified ${audioModeName(wantPassthrough)} at $speed")
+            return@Runnable
+        }
         if (audioModeRetries >= AUDIO_MODE_MAX_RETRIES) {
-            Logger.logInfo(
-                AUDIO_LOG_TAG,
-                "audio mode: still ${audioModeName(!wantPassthrough)} at $speed after " +
+            AudioDiag.log(
+                "audio mode: still ${audioModeName(sink.isPassthrough)} at $speed after " +
                     "$audioModeRetries retries, leaving it",
             )
             return@Runnable
         }
         audioModeRetries++
-        Logger.logInfo(
-            AUDIO_LOG_TAG,
-            "audio mode: still ${audioModeName(!wantPassthrough)} at $speed, retry $audioModeRetries",
+        AudioDiag.log(
+            "audio mode: still ${audioModeName(sink.isPassthrough)} at $speed, " +
+                "retry $audioModeRetries",
         )
-        audioModePending = true
-        audioModePendingSpeed = speed
-        audioModeSwitchMs = SystemClock.uptimeMillis()
-        reselectAudioTrackForMode()
+        doAudioReselect("verify retry")
+    }
+
+    /**
+     * 兜底看门狗：音轨被禁用超过 [AUDIO_WATCHDOG_GRACE_MS] 就恢复，
+     * 顺带把闸门与速度重新对齐。这是"没声音"那类故障的最终保险。
+     */
+    private val audioTrackWatchdog = object : Runnable {
+        override fun run() {
+            val player = mediaSession?.player
+            if (player != null &&
+                SystemClock.uptimeMillis() - audioReselectAtMs > AUDIO_WATCHDOG_GRACE_MS
+            ) {
+                restoreAudioTrackType("watchdog")
+                enforceAudioMode("watchdog")
+            }
+            reselectHandler.postDelayed(this, AUDIO_WATCHDOG_INTERVAL_MS)
+        }
+    }
+
+    /** 当前选中音频轨的 mime；没有选中音轨时返回 null。 */
+    private fun selectedAudioMime(): String? = mediaSession?.player?.currentTracks?.groups
+        ?.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }
+        ?.mediaTrackGroup?.getFormat(0)?.sampleMimeType
+
+    /** 当前解码器模式下能否解出这条音轨；解不了就不要拦直通（宁可速度不生效也不能静音）。 */
+    private fun canDecodeSelectedAudio(): Boolean {
+        if (decodeBlockedForItem) return false
+        val mime = selectedAudioMime() ?: return true
+        return canDecodeAudioMime(mime, decoderManager.audioMode)
     }
 
     private fun audioModeName(passthrough: Boolean): String =
@@ -938,6 +989,10 @@ class PlayerService : MediaSessionService() {
         } catch (e: Exception) {
             e.printStackTrace()
         }
+
+        // 音频管线看门狗：兜底恢复被我们禁用的音轨、纠正闸门与速度不一致
+        reselectHandler.removeCallbacks(audioTrackWatchdog)
+        reselectHandler.postDelayed(audioTrackWatchdog, AUDIO_WATCHDOG_INTERVAL_MS)
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -964,6 +1019,7 @@ class PlayerService : MediaSessionService() {
     override fun onDestroy() {
         super.onDestroy()
         artworkLoadJob?.cancel()
+        reselectHandler.removeCallbacksAndMessages(null)
         loudnessEnhancer?.release()
         loudnessEnhancer = null
         mediaSession?.run {
@@ -1093,6 +1149,23 @@ class PlayerService : MediaSessionService() {
         val groups = tracks.groups.filter { it.type == mediaTrackType }
         val hasTrack = groups.isNotEmpty() || trackSelector.unmappedTrackCount(mediaTrackType) > 0
         if (!hasTrack || groups.any { it.isSupported(true) }) return
+
+        // 音频轨"全部不支持"很可能是我们自己造成的：非 1 倍速时闸门拦掉了直通，
+        // 而当前解码器模式（例如「软解+」）根本解不出这个压缩格式。
+        // 这时先放开闸门（宁可速度不生效）并记下来别再试，不要弹"没有支持此媒体的解码器"。
+        if (trackType == DecoderTrackType.AUDIO) {
+            val sink = speedAudioFactory?.gateSink
+            if (sink != null && sink.forceDecode) {
+                AudioDiag.log(
+                    "audio track unsupported while forced to decode, releasing the gate " +
+                        "(decoder mode=${decoderManager.audioMode})",
+                )
+                decodeBlockedForItem = true
+                sink.setForceDecode(false)
+                requestAudioReselect("unsupported fallback")
+                return
+            }
+        }
 
         handleDecoderFailure(trackType)
     }
@@ -1248,19 +1321,34 @@ private val DecoderTrackType.mediaTrackType: Int
 
 private const val DECODER_LOG_TAG = "Decoder"
 
-private const val AUDIO_LOG_TAG = "AudioMode"
-
 /** 判定"还在 1 倍速"的容差；与 JustPlus.Player 取值一致。 */
 private const val SPEED_UNITY_EPSILON = 0.005f
 
 /** 两次管线切换之间的最小间隔，避免连按上下键时反复重选打断声音。 */
 private const val AUDIO_MODE_MIN_INTERVAL_MS = 900L
 
+/**
+ * 禁用音轨后多久**无条件**恢复。
+ *
+ * 这是"没声音"故障的核心保险：目标机上 `onTracksChanged` 有时不来、
+ * `currentTracks` 的 selected 标志也不更新，靠回调恢复会让音轨永久 disabled。
+ */
+private const val AUDIO_RESELECT_RESTORE_MS = 250L
+
 /** 重选完成后等多久校验实际状态（给渲染器、AudioTrack 留出初始化时间）。 */
 private const val AUDIO_MODE_VERIFY_DELAY_MS = 700L
 
-/** 校验不通过时最多重试几次。 */
-private const val AUDIO_MODE_MAX_RETRIES = 2
+/** 校验不通过时最多重试几次（重试会再断一次声音，不宜多）。 */
+private const val AUDIO_MODE_MAX_RETRIES = 1
+
+/** 就绪/开播后延迟多久做一次闸门对齐，等渲染器与轨道信息稳定。 */
+private const val AUDIO_MODE_ALIGN_DELAY_MS = 600L
+
+/** 看门狗轮询间隔。 */
+private const val AUDIO_WATCHDOG_INTERVAL_MS = 3000L
+
+/** 看门狗宽限：距上次重选超过这个时间仍处于禁用/错位状态就强行纠正。 */
+private const val AUDIO_WATCHDOG_GRACE_MS = 2500L
 
 @get:UnstableApi
 @set:UnstableApi

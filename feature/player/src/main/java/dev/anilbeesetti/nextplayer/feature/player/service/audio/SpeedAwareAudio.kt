@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.os.Build
 import android.util.Log
 import androidx.media3.common.C
@@ -16,9 +18,59 @@ import androidx.media3.exoplayer.audio.AudioCapabilities
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.ForwardingAudioSink
+import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderMode
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
+import java.io.File
 import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
+
+/**
+ * 音频管线诊断日志。
+ *
+ * 为什么需要写文件：目标机（TCL m7642 / Android 9）的 logcat 环形缓冲区几乎不产出内容
+ * （清空后数分钟只有十几行，`logcat -G 4M` 也无效），release 包又经过 R8，
+ * 应用日志基本取不到。所以把关键决策落盘到
+ * `/sdcard/Android/data/<pkg>/files/diag/audio.log`，用 adb pull 取回。
+ *
+ * 只在关键事件写（管线配置、折叠决策、闸门切换、重选与恢复），不做逐帧记录，
+ * 文件上限 [MAX_BYTES]，超出即整体截断重写，避免无限增长。
+ */
+internal object AudioDiag {
+
+    private const val MAX_BYTES = 512 * 1024L
+    private const val FILE_NAME = "audio.log"
+
+    @Volatile
+    private var file: File? = null
+
+    private val timeFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    private val lock = Any()
+
+    fun init(context: Context) {
+        if (file != null) return
+        val dir = runCatching { context.getExternalFilesDir("diag") }.getOrNull() ?: return
+        runCatching {
+            if (!dir.exists()) dir.mkdirs()
+            val target = File(dir, FILE_NAME)
+            if (target.exists() && target.length() > MAX_BYTES) target.delete()
+            file = target
+        }
+    }
+
+    fun log(message: String) {
+        Log.i(TAG, message)
+        val target = file ?: return
+        val line = "${timeFormat.format(Date())} $message\n"
+        synchronized(lock) {
+            runCatching {
+                target.appendText(line)
+            }
+        }
+    }
+}
 
 /**
  * 播放速度对音频输出方式的要求：1 倍速与其它速度必须走不同管线。
@@ -72,9 +124,19 @@ class PassthroughGateAudioSink(
     var isPassthrough: Boolean = false
         private set
 
+    /** 闸门当前期望值（true = 强制解码）。调用方据此判断是否已对齐，不必依赖增量回调。 */
+    val forceDecode: Boolean
+        get() = mode.forceDecode
+
     override fun configure(audioSinkConfig: AudioSink.AudioSinkConfig) {
-        val mimeType = audioSinkConfig.format.sampleMimeType
+        val format = audioSinkConfig.format
+        val mimeType = format.sampleMimeType
         isPassthrough = mimeType != null && mimeType != MimeTypes.AUDIO_RAW
+        AudioDiag.log(
+            "sink.configure: mime=$mimeType ch=${format.channelCount} " +
+                "rate=${format.sampleRate} pcm=${format.pcmEncoding} " +
+                "passthrough=$isPassthrough forceDecode=${mode.forceDecode}",
+        )
         super.configure(audioSinkConfig)
     }
 
@@ -84,6 +146,7 @@ class PassthroughGateAudioSink(
     fun setForceDecode(forceDecode: Boolean): Boolean {
         if (mode.forceDecode == forceDecode) return false
         mode.forceDecode = forceDecode
+        AudioDiag.log("gate: forceDecode=$forceDecode")
         return true
     }
 
@@ -94,7 +157,15 @@ class PassthroughGateAudioSink(
     fun revoke(mimeType: String?) {
         if (mimeType.isNullOrEmpty()) return
         if (deniedMimes.add(mimeType)) {
-            Log.w(TAG, "passthrough revoked for $mimeType, falling back to decode")
+            AudioDiag.log("passthrough revoked for $mimeType, falling back to decode")
+        }
+    }
+
+    /** 换片源时清空拉黑记录：上一部片源失败的格式不代表这一部也失败。 */
+    fun clearDenylist() {
+        if (deniedMimes.isNotEmpty()) {
+            AudioDiag.log("passthrough denylist cleared: $deniedMimes")
+            deniedMimes.clear()
         }
     }
 
@@ -158,7 +229,7 @@ internal class DownmixToStereoAudioProcessor(
         if (channels <= STEREO_CHANNEL_COUNT) return AudioProcessor.AudioFormat.NOT_SET
         // 路由自己就能承载这么多声道，不必折叠
         if (routePcmChannels in (STEREO_CHANNEL_COUNT + 1)..channels) {
-            Log.i(TAG, "downmix skipped: route accepts $routePcmChannels ch (input $channels ch)")
+            AudioDiag.log("downmix skipped: route accepts $routePcmChannels ch (input $channels ch)")
             return AudioProcessor.AudioFormat.NOT_SET
         }
 
@@ -166,7 +237,10 @@ internal class DownmixToStereoAudioProcessor(
             ?: if (channels > MAX_KNOWN_LAYOUT) widen(channels) else return AudioProcessor.AudioFormat.NOT_SET
         gains = matrix
         inputChannels = channels
-        Log.i(TAG, "downmix: folding $channels channels to stereo (route pcm channels=$routePcmChannels)")
+        AudioDiag.log(
+            "downmix: folding $channels ch -> 2 ch at ${inputAudioFormat.sampleRate}Hz " +
+                "(encoding=$encoding, route pcm channels=$routePcmChannels)",
+        )
         return AudioProcessor.AudioFormat(inputAudioFormat.sampleRate, STEREO_CHANNEL_COUNT, encoding)
     }
 
@@ -179,8 +253,13 @@ internal class DownmixToStereoAudioProcessor(
         val isFloat = inputAudioFormat.encoding == C.ENCODING_PCM_FLOAT
         val scale = if (isFloat) 1.0f else PCM16_SCALE
         val bytesPerSample = if (isFloat) FLOAT_BYTES else PCM16_BYTES
-        val frames = inputBuffer.remaining() / (bytesPerSample * channels)
-        if (frames <= 0) return
+        val frameBytes = bytesPerSample * channels
+        val frames = inputBuffer.remaining() / frameBytes
+        if (frames <= 0) {
+            // 连一帧都凑不齐：整段丢弃，避免残留字节把后续声道相位带偏
+            inputBuffer.position(inputBuffer.limit())
+            return
+        }
 
         val out = replaceOutputBuffer(frames * STEREO_CHANNEL_COUNT * bytesPerSample)
         for (frame in 0 until frames) {
@@ -202,6 +281,8 @@ internal class DownmixToStereoAudioProcessor(
                 out.putShort(quantize(right))
             }
         }
+        // 末尾不足一帧的残字节直接丢弃：留在 buffer 里会让下一批数据的声道相位错位
+        inputBuffer.position(inputBuffer.limit())
         out.flip()
     }
 
@@ -211,7 +292,7 @@ internal class DownmixToStereoAudioProcessor(
         if (magnitude <= KNEE) return value
         if (!limited) {
             limited = true
-            Log.w(TAG, "downmix: the fold reached the limiter, this mix is mastered at full scale")
+            AudioDiag.log("downmix: the fold reached the limiter, this mix is mastered at full scale")
         }
         val excess = magnitude - KNEE
         val shaped = KNEE + (excess * SLOPE) / (excess + SLOPE)
@@ -233,6 +314,14 @@ internal class DownmixToStereoAudioProcessor(
 
         /** 侧环绕增益 -3dB。 */
         const val SURROUND_GAIN = 0.7071f
+
+        /**
+         * LFE 折叠增益 -9dB。
+         *
+         * Dolby 规范里 2.0 折叠默认丢弃 LFE；但实测丢弃后整体听感明显发薄，
+         * 所以保留一点点低频能量。取值足够低，配合 [HEADROOM] 与 [bend] 不会过载。
+         */
+        const val LFE_GAIN = 0.354f
 
         /** 输出余量 -6dB，给软限幅器留头。 */
         const val HEADROOM = 0.5f
@@ -258,30 +347,30 @@ internal class DownmixToStereoAudioProcessor(
             4 -> arrayOf( // FL FR BL BR
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
-                floatArrayOf(BACK_GAIN, 0f),
-                floatArrayOf(0f, BACK_GAIN),
+                floatArrayOf(SURROUND_GAIN, 0f),
+                floatArrayOf(0f, SURROUND_GAIN),
             )
             5 -> arrayOf( // FL FR FC BL BR
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(BACK_GAIN, 0f),
-                floatArrayOf(0f, BACK_GAIN),
+                floatArrayOf(SURROUND_GAIN, 0f),
+                floatArrayOf(0f, SURROUND_GAIN),
             )
             6 -> arrayOf( // FL FR FC LFE BL BR —— 5.1，本机主力片源就是这个
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(0f, 0f),
-                floatArrayOf(BACK_GAIN, 0f),
-                floatArrayOf(0f, BACK_GAIN),
+                floatArrayOf(LFE_GAIN, LFE_GAIN),
+                floatArrayOf(SURROUND_GAIN, 0f),
+                floatArrayOf(0f, SURROUND_GAIN),
             )
             7 -> arrayOf( // FL FR FC LFE BC SL SR —— 6.1
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(0f, 0f),
-                floatArrayOf(0.5f, 0.5f),
+                floatArrayOf(LFE_GAIN, LFE_GAIN),
+                floatArrayOf(BACK_GAIN, BACK_GAIN),
                 floatArrayOf(SURROUND_GAIN, 0f),
                 floatArrayOf(0f, SURROUND_GAIN),
             )
@@ -289,7 +378,7 @@ internal class DownmixToStereoAudioProcessor(
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(0f, 0f),
+                floatArrayOf(LFE_GAIN, LFE_GAIN),
                 floatArrayOf(BACK_GAIN, 0f),
                 floatArrayOf(0f, BACK_GAIN),
                 floatArrayOf(SURROUND_GAIN, 0f),
@@ -305,9 +394,9 @@ internal class DownmixToStereoAudioProcessor(
                 if (index < base.size) {
                     base[index]
                 } else if ((index - base.size) % 2 == 0) {
-                    floatArrayOf(BACK_GAIN, 0f)
+                    floatArrayOf(SURROUND_GAIN, 0f)
                 } else {
-                    floatArrayOf(0f, BACK_GAIN)
+                    floatArrayOf(0f, SURROUND_GAIN)
                 }
             }
         }
@@ -344,6 +433,14 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
 
     var gateSink: PassthroughGateAudioSink? = null
         private set
+
+    init {
+        AudioDiag.init(context)
+        AudioDiag.log(
+            "factory ready: routePcmChannels=$routePcmChannels " +
+                "capabilities=${forcedAudioCapabilities(context)}",
+        )
+    }
 
     override fun buildAudioSink(
         context: Context,
@@ -401,8 +498,58 @@ fun pcmChannelsOfRoute(context: Context): Int {
         sawHdmi -> if (hdmiChannels > 0) hdmiChannels else STEREO_ROUTE_CHANNELS
         else -> anyChannels
     }
-    Log.i(TAG, "route pcm channels=$result (any=$anyChannels hdmi=$hdmiChannels sawHdmi=$sawHdmi)")
+    AudioDiag.log("route pcm channels=$result (any=$anyChannels hdmi=$hdmiChannels sawHdmi=$sawHdmi)")
     return result
+}
+
+/**
+ * 当前音频解码器模式能否解出 [mimeType]。
+ *
+ * 非 1 倍速时必须解码压缩音轨才能变速。若用户把音频解码器钉在「软解+」
+ * （`DecoderMode.SOFTWARE`，只用 `c2.android.*` / `OMX.google.*`）而本机
+ * E-AC3 只有厂商硬件解码器，就会陷入：闸门拦掉直通 → 解码器不存在 →
+ * 音轨被判不支持 → 弹「没有支持此媒体的解码器」且静音。
+ * 所以切换前先问一句；解不了就不拦直通（宁可速度不生效，也不能没声音）。
+ *
+ * `FFMPEG` 模式由 nextlib 的 FFmpegAudioRenderer 兜底，视为总能解码。
+ */
+@UnstableApi
+fun canDecodeAudioMime(mimeType: String?, mode: DecoderMode): Boolean {
+    if (mimeType.isNullOrEmpty()) return true
+    if (mimeType == MimeTypes.AUDIO_RAW) return true
+    if (mode == DecoderMode.FFMPEG) return true
+
+    val requireHardware = mode == DecoderMode.HARDWARE
+    val requireSoftware = mode == DecoderMode.SOFTWARE
+    val codecList = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
+        .getOrDefault(emptyArray())
+    val found = codecList.any { info ->
+        if (info.isEncoder) return@any false
+        if (info.supportedTypes.none { it.equals(mimeType, ignoreCase = true) }) return@any false
+        val hardware = isHardwareCodec(info)
+        when {
+            requireHardware -> hardware
+            requireSoftware -> !hardware
+            else -> true
+        }
+    }
+    if (!found) {
+        AudioDiag.log("no decoder for $mimeType under mode=$mode, keeping pass-through")
+    }
+    return found
+}
+
+/** `MediaCodecInfo.isHardwareAccelerated` 是 API 29，旧机型只能按名字前缀判断。 */
+private fun isHardwareCodec(info: MediaCodecInfo): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        return runCatching { info.isHardwareAccelerated }.getOrDefault(true)
+    }
+    val name = info.name
+    val software = name.startsWith("OMX.google.") ||
+        name.startsWith("OMX.ffmpeg.") ||
+        name.startsWith("c2.android.") ||
+        name.contains("software", ignoreCase = true)
+    return !software
 }
 
 /**
@@ -431,7 +578,7 @@ fun forcedAudioCapabilities(context: Context): AudioCapabilities {
         encodings.toIntArray(),
         maxOf(base.maxChannelCount, PASSTHROUGH_MAX_CHANNEL_COUNT),
     )
-    Log.i(TAG, "audio capabilities: $capabilities")
+    AudioDiag.log("audio capabilities: $capabilities (system reported $base)")
     return capabilities
 }
 
