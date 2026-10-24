@@ -453,10 +453,15 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         // （ExoPlayer 侧表现为 Decoder failed + IllegalStateException），而同一文件用
         // 系统 HEVC 解码器路径可正常出画。所以把 Dolby Vision 强制交给 HEVC 解码器。
         setMediaCodecSelector(DolbyVisionHevcSelector(MediaCodecSelector.DEFAULT))
-        setCodecAdapterFactory(
-            DolbyVisionHevcAdapterFactory(MediaCodecAdapter.Factory.getDefault(context)),
-        )
     }
+
+    /**
+     * 解码器已经换成 HEVC 组件，MediaFormat 的 mime 必须同步改掉（见
+     * [DolbyVisionHevcAdapterFactory]）。`DefaultRenderersFactory` 没有 setter，
+     * 但把 `codecAdapterFactory` 暴露成 protected getter，覆盖它即可。
+     */
+    override fun getCodecAdapterFactory(): MediaCodecAdapter.Factory =
+        DolbyVisionHevcAdapterFactory(super.getCodecAdapterFactory())
 
     override fun buildAudioSink(
         context: Context,
