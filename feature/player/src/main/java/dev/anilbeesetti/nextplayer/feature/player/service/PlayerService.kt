@@ -1224,6 +1224,25 @@ class PlayerService : MediaSessionService() {
         val hasTrack = groups.isNotEmpty() || trackSelector.unmappedTrackCount(mediaTrackType) > 0
         if (!hasTrack || groups.any { it.isSupported(true) }) return
 
+        // 本机 logcat 拿不到应用日志：把"为什么判不支持"落盘，否则只能看到最终 UI 文案
+        AudioDiag.log(
+            "unsupported track: type=$trackType " +
+                "requestedVideo=${decoderManager.videoMode} activeVideo=${decoderManager.activeVideoMode} " +
+                "requestedAudio=${decoderManager.audioMode} activeAudio=${decoderManager.activeAudioMode} " +
+                "unmapped=${trackSelector.unmappedTrackCount(mediaTrackType)}",
+        )
+        for (group in groups) {
+            for (index in 0 until group.length) {
+                val format = group.getTrackFormat(index)
+                AudioDiag.log(
+                    "  track[$index] mime=${format.sampleMimeType} codecs=${format.codecs} " +
+                        "${format.width}x${format.height} " +
+                        "${format.channelCount}ch/${format.sampleRate}Hz " +
+                        "supported=${group.isTrackSupported(index)} selected=${group.isTrackSelected(index)}",
+                )
+            }
+        }
+
         // 音频轨"全部不支持"很可能是我们自己造成的：非 1 倍速时闸门拦掉了直通，
         // 而当前解码器模式（例如「软解+」）根本解不出这个压缩格式。
         // 这时先放开闸门（宁可速度不生效）并记下来别再试，不要弹"没有支持此媒体的解码器"。
