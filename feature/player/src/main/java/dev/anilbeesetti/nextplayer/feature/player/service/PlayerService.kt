@@ -969,7 +969,9 @@ class PlayerService : MediaSessionService() {
     }
 
     /** 1 倍速稳住之后才切回码流，见 [updateSpeedAudioMode]。 */
-    private val bitstreamRestoreRunnable = Runnable {
+    // 显式标注 Runnable：lambda 内部要引用自己（重试排队），不标类型会触发
+    // "Type checking has run into a recursive problem"。
+    private val bitstreamRestoreRunnable: Runnable = Runnable {
         val sink = speedAudioFactory?.gateSink ?: return@Runnable
         val player = mediaSession?.player ?: return@Runnable
         // 排队期间用户又提速了：保持解码，什么都不做
