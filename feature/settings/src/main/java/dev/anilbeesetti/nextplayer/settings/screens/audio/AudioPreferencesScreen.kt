@@ -120,6 +120,13 @@ private fun AudioPreferencesScreenContent(
                     icon = NextIcons.VolumeUp,
                     isChecked = state.preferences.enableVolumeBoost,
                     onClick = { onAction(AudioPreferencesUiEvent.ToggleVolumeBoost) },
+                )
+                PreferenceSwitch(
+                    title = stringResource(R.string.passthrough_any_speed),
+                    description = stringResource(R.string.passthrough_any_speed_desc),
+                    icon = NextIcons.Speed,
+                    isChecked = state.preferences.passthroughAtAnySpeed,
+                    onClick = { onAction(AudioPreferencesUiEvent.TogglePassthroughAnySpeed) },
                     isLastItem = true,
                 )
             }

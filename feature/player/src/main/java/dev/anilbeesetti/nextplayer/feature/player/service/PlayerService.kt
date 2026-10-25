@@ -807,6 +807,16 @@ class PlayerService : MediaSessionService() {
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
 
+        // 通道 B（设置里的「倍速时保持直通」）：管线一律不动，速度直接交给平台。
+        // 只安排一次回读，看 AudioTrack 到底接受了多少速率 —— 这条路径能不能听，
+        // 完全取决于电视固件，日志里的 accepted 就是实测答案。
+        if (playerPreferences.passthroughAtAnySpeed) {
+            sink.setForceDecode(false)
+            reselectHandler.removeCallbacks(audioModeVerifyRunnable)
+            reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
+            return
+        }
+
         // PCM 源（AAC / MP3 / FLAC / Opus…）本来就是 PCM 出去，变速由 Sonic 完成，
         // 重选音轨只会白重建一次音频渲染器（听感上就是每次调速度都断一下）。
         if (!shouldManageAudioPipeline()) {
@@ -941,6 +951,19 @@ class PlayerService : MediaSessionService() {
         audioRestartInFlight = false
         restoreAudioTrackType("verify")
 
+        // 通道 B 的回读：accepted 是 AudioTrack 承认的速率。
+        // asked≠accepted 说明平台拒绝了变速（media3 会吞掉 IllegalArgumentException），
+        // 此时声音仍按 1 倍速走、画面按 requested 走 —— 音画必然漂移。
+        if (playerPreferences.passthroughAtAnySpeed) {
+            AudioDiag.log(
+                "passthrough speed: asked=${player.playbackParameters.speed} " +
+                    "accepted=${sink.playbackParameters.speed} " +
+                    "passthrough=${sink.isPassthrough}",
+            )
+            audioModeRetries = 0
+            return@Runnable
+        }
+
         if (!shouldManageAudioPipeline()) return@Runnable
         if (!player.isPlaying) return@Runnable
 
@@ -1014,6 +1037,8 @@ class PlayerService : MediaSessionService() {
      */
     private fun shouldManageAudioPipeline(): Boolean {
         val sink = speedAudioFactory?.gateSink ?: return false
+        // 通道 B：用户选择"倍速也保持直通"，按速度切管线这条路整个不参与。
+        if (playerPreferences.passthroughAtAnySpeed) return false
         if (sink.passthroughEverSeen || sink.isPassthrough) return true
         val mime = selectedAudioMime() ?: return false
         return mime in PASSTHROUGH_MIME_TYPES
@@ -1034,6 +1059,10 @@ class PlayerService : MediaSessionService() {
         decoderManager = DecoderManager()
         val renderersFactory = SpeedAwareRenderersFactory(applicationContext).apply {
             setDecoderManager(decoderManager)
+            // sink 的输出配置在建 player 时定死，所以这里是唯一能设进去的时机。
+            // 改设置后重开播放器生效（设置页里已写明）。
+            passthroughAtAnySpeed = playerPreferences.passthroughAtAnySpeed
+            AudioDiag.log("speed audio mode: anySpeedPassthrough=$passthroughAtAnySpeed")
         }
         speedAudioFactory = renderersFactory
 

@@ -208,6 +208,8 @@
     <string name="properties">Properties</string>
     <string name="volume_boost">Volume boost</string>
     <string name="volume_boost_desc">Boost audio volume up to 200%</string>
+    <string name="passthrough_any_speed">Bitstream at any speed (experimental)</string>
+    <string name="passthrough_any_speed_desc">Off: any speed other than 1x is decoded to 2-channel PCM, so pitch stays natural. On: the compressed stream keeps going to the receiver at every speed and the TV is left to handle the speed itself — depends entirely on the TV firmware and may sound broken or drift out of sync. Takes effect the next time the player opens.</string>
     <string name="open_audio">Open local audio</string>
     <string name="error_opening_audio">Can’t open this audio file</string>
     <string name="open_subtitle">Open local subtitle</string>

@@ -50,6 +50,7 @@ class AudioPreferencesViewModel(
             is AudioPreferencesUiEvent.ToggleShowSystemVolumePanel -> toggleShowSystemVolumePanel()
             is AudioPreferencesUiEvent.ToggleRequireAudioFocus -> toggleRequireAudioFocus()
             is AudioPreferencesUiEvent.ToggleVolumeBoost -> toggleVolumeBoost()
+            is AudioPreferencesUiEvent.TogglePassthroughAnySpeed -> togglePassthroughAnySpeed()
         }
     }
 
@@ -98,6 +99,14 @@ class AudioPreferencesViewModel(
             }
         }
     }
+
+    private fun togglePassthroughAnySpeed() {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences {
+                it.copy(passthroughAtAnySpeed = !it.passthroughAtAnySpeed)
+            }
+        }
+    }
 }
 
 @Stable
@@ -119,4 +128,5 @@ sealed interface AudioPreferencesUiEvent {
     data object ToggleShowSystemVolumePanel : AudioPreferencesUiEvent
     data object ToggleRequireAudioFocus : AudioPreferencesUiEvent
     data object ToggleVolumeBoost : AudioPreferencesUiEvent
+    data object TogglePassthroughAnySpeed : AudioPreferencesUiEvent
 }

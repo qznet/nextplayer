@@ -453,6 +453,28 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
     /** 本机输出路由能承载的 PCM 声道数（启动时探测一次，播放中不会变）。 */
     val routePcmChannels: Int = pcmChannelsOfRoute(context)
 
+    /**
+     * 非 1 倍速时是否把变速交给平台（AudioTrack），即"倍速也保持直通"。
+     *
+     * 从 [dev.anilbeesetti.nextplayer.core.model.PlayerPreferences.passthroughAtAnySpeed] 同步过来，
+     * **只在建 player 时读取**，改设置后要重开播放器才生效（sink 的输出配置在构建时就定了）。
+     *
+     * 为什么必须显式打开：media3 1.11.1 的 `AudioTrackAudioOutputProvider#getOutputConfig`
+     * 在直通分支上写死了
+     * `usePlaybackParameters = formatConfig.enablePlaybackParameters`，注释原文
+     * "Passthrough only supports audio output playback parameters, but we only enable it
+     * this was specifically requested by the app"；而这个 `enablePlaybackParameters` 就是
+     * `DefaultAudioSink.Builder#setEnableAudioOutputPlaybackParameters` 的值（默认 false）。
+     * 也就是说：**默认的直通路径根本不接受变速**，不是"交给 AudioTrack 重采样"。
+     *
+     * 打开之后 `AudioTrackAudioOutput#setPlaybackParameters` 会用
+     * `PlaybackParams.setAudioFallbackMode(AUDIO_FALLBACK_MODE_FAIL)` 提交，平台做不了就抛
+     * `IllegalArgumentException` 并被 media3 吞掉（日志 `Failed to set playback params`），
+     * 实际速率退回 1.0 —— 用 `AudioSink#getPlaybackParameters` 能读回真实值。
+     */
+    @Volatile
+    var passthroughAtAnySpeed: Boolean = false
+
     var gateSink: PassthroughGateAudioSink? = null
         private set
 
@@ -478,14 +500,16 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         enableAudioOutputPlaybackParameters: Boolean,
     ): AudioSink? {
         sinkBuildCount++
+        // 通道 B（倍速保持直通）：把 sink 的变速责任交给 AudioTrack，直通分支才会接受速度。
+        val askPlatformSpeed = enableAudioOutputPlaybackParameters || passthroughAtAnySpeed
         AudioDiag.log(
             "buildAudioSink #$sinkBuildCount (float=$enableFloatOutput " +
-                "playbackParams=$enableAudioOutputPlaybackParameters)",
+                "playbackParams=$askPlatformSpeed anySpeedPassthrough=$passthroughAtAnySpeed)",
         )
         val sink = DefaultAudioSink.Builder(context)
             .setAudioCapabilities(forcedAudioCapabilities(context))
             .setEnableFloatOutput(enableFloatOutput)
-            .setEnableAudioOutputPlaybackParameters(enableAudioOutputPlaybackParameters)
+            .setEnableAudioOutputPlaybackParameters(askPlatformSpeed)
             .setAudioProcessorChain(
                 DefaultAudioSink.DefaultAudioProcessorChain(
                     DownmixToStereoAudioProcessor(routePcmChannels),

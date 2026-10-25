@@ -48,6 +48,16 @@ data class PlayerPreferences(
     val showSystemVolumePanel: Boolean = true,
     val enableVolumeBoost: Boolean = false,
 
+    /**
+     * 非 1 倍速时是否保留压缩码流直通。
+     *
+     * - false（默认）：非 1 倍速关闭直通，解码成 PCM 并折叠成 2 声道，变速由 Sonic 完成，
+     *   音调不变，任何电视都稳定。
+     * - true：任何速度都把压缩码流交给功放，变速责任交给电视的 AudioTrack（平台变速）。
+     *   平台能不能做好完全取决于固件：见 `SpeedAwareRenderersFactory` 的说明。
+     */
+    val passthroughAtAnySpeed: Boolean = false,
+
     // Subtitle Preferences
     val useSystemCaptionStyle: Boolean = false,
     val preferredSubtitleLanguage: String = "",
