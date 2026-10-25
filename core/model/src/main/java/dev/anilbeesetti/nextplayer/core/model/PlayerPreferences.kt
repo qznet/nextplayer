@@ -49,14 +49,27 @@ data class PlayerPreferences(
     val enableVolumeBoost: Boolean = false,
 
     /**
-     * 非 1 倍速时是否保留压缩码流直通。
+     * 已停用，只为兼容旧设置文件保留（旧版本可能已把它存成 true）。
      *
-     * - false（默认）：非 1 倍速关闭直通，解码成 PCM 并折叠成 2 声道，变速由 Sonic 完成，
-     *   音调不变，任何电视都稳定。
-     * - true：任何速度都把压缩码流交给功放，变速责任交给电视的 AudioTrack（平台变速）。
-     *   平台能不能做好完全取决于固件：见 `SpeedAwareRenderersFactory` 的说明。
+     * 2026-10-25 实机结论：打开后 AudioTrack 会接受变速请求、功放保持最后一次显示，但
+     * **完全静音** —— 这台电视（TCL/雷鸟 m7642，Android 9）的音频 HAL 对
+     * `set_playback_rate_parameters(IEC61937)` 只"受理"不实现。该分支已从逻辑里摘除，
+     * 无论存的是什么都按 false 处理，界面上也不再暴露。
      */
     val passthroughAtAnySpeed: Boolean = false,
+
+    /**
+     * 全程解码成 PCM 并折叠 2 声道，不论速度。
+     *
+     * - false（默认）：1 倍速保留压缩码流直通（真正的 5.1 / Atmos），非 1 倍速解码成 2 声道。
+     *   代价是跨越 1 倍速时音频渲染器要重建一次：本机实测约 0.2 秒空档，加上功放重新锁定，
+     *   听感/观感上就是"短暂切了一次立体声"。
+     * - true：整场播放都用 PCM，来回改速度完全不重建、不中断，但 1 倍速也只剩 2 声道。
+     *
+     * 只影响压缩音轨（AC3/EAC3/DTS…）；PCM 音源本来就绕开这套逻辑。
+     * 建 player 时读取，改设置后要重开播放器。
+     */
+    val alwaysDecodeToStereo: Boolean = false,
 
     // Subtitle Preferences
     val useSystemCaptionStyle: Boolean = false,

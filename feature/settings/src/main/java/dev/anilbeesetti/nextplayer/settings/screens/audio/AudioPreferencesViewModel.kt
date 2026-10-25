@@ -50,7 +50,7 @@ class AudioPreferencesViewModel(
             is AudioPreferencesUiEvent.ToggleShowSystemVolumePanel -> toggleShowSystemVolumePanel()
             is AudioPreferencesUiEvent.ToggleRequireAudioFocus -> toggleRequireAudioFocus()
             is AudioPreferencesUiEvent.ToggleVolumeBoost -> toggleVolumeBoost()
-            is AudioPreferencesUiEvent.TogglePassthroughAnySpeed -> togglePassthroughAnySpeed()
+            is AudioPreferencesUiEvent.ToggleAlwaysDecodeToStereo -> toggleAlwaysDecodeToStereo()
         }
     }
 
@@ -100,10 +100,10 @@ class AudioPreferencesViewModel(
         }
     }
 
-    private fun togglePassthroughAnySpeed() {
+    private fun toggleAlwaysDecodeToStereo() {
         viewModelScope.launch {
             preferencesRepository.updatePlayerPreferences {
-                it.copy(passthroughAtAnySpeed = !it.passthroughAtAnySpeed)
+                it.copy(alwaysDecodeToStereo = !it.alwaysDecodeToStereo)
             }
         }
     }
@@ -128,5 +128,5 @@ sealed interface AudioPreferencesUiEvent {
     data object ToggleShowSystemVolumePanel : AudioPreferencesUiEvent
     data object ToggleRequireAudioFocus : AudioPreferencesUiEvent
     data object ToggleVolumeBoost : AudioPreferencesUiEvent
-    data object TogglePassthroughAnySpeed : AudioPreferencesUiEvent
+    data object ToggleAlwaysDecodeToStereo : AudioPreferencesUiEvent
 }

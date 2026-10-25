@@ -454,26 +454,13 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
     val routePcmChannels: Int = pcmChannelsOfRoute(context)
 
     /**
-     * 非 1 倍速时是否把变速交给平台（AudioTrack），即"倍速也保持直通"。
+     * 全程都解码成 PCM（"不让速度打断声音"）。建 player 时从偏好同步过来。
      *
-     * 从 [dev.anilbeesetti.nextplayer.core.model.PlayerPreferences.passthroughAtAnySpeed] 同步过来，
-     * **只在建 player 时读取**，改设置后要重开播放器才生效（sink 的输出配置在构建时就定了）。
-     *
-     * 为什么必须显式打开：media3 1.11.1 的 `AudioTrackAudioOutputProvider#getOutputConfig`
-     * 在直通分支上写死了
-     * `usePlaybackParameters = formatConfig.enablePlaybackParameters`，注释原文
-     * "Passthrough only supports audio output playback parameters, but we only enable it
-     * this was specifically requested by the app"；而这个 `enablePlaybackParameters` 就是
-     * `DefaultAudioSink.Builder#setEnableAudioOutputPlaybackParameters` 的值（默认 false）。
-     * 也就是说：**默认的直通路径根本不接受变速**，不是"交给 AudioTrack 重采样"。
-     *
-     * 打开之后 `AudioTrackAudioOutput#setPlaybackParameters` 会用
-     * `PlaybackParams.setAudioFallbackMode(AUDIO_FALLBACK_MODE_FAIL)` 提交，平台做不了就抛
-     * `IllegalArgumentException` 并被 media3 吞掉（日志 `Failed to set playback params`），
-     * 实际速率退回 1.0 —— 用 `AudioSink#getPlaybackParameters` 能读回真实值。
+     * 置位后 sink 在**第一次 configure 之前**就被设成解码态，因此整场播放不会出现
+     * 直通↔解码的切换，也就没有那 0.2 秒重建空档。代价是 1 倍速也只剩 2 声道。
      */
     @Volatile
-    var passthroughAtAnySpeed: Boolean = false
+    var alwaysDecodeToStereo: Boolean = false
 
     var gateSink: PassthroughGateAudioSink? = null
         private set
@@ -500,11 +487,15 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         enableAudioOutputPlaybackParameters: Boolean,
     ): AudioSink? {
         sinkBuildCount++
-        // 通道 B（倍速保持直通）：把 sink 的变速责任交给 AudioTrack，直通分支才会接受速度。
-        val askPlatformSpeed = enableAudioOutputPlaybackParameters || passthroughAtAnySpeed
+        // 变速一律由 Sonic 在 PCM 域完成。直通分支只有在 app 明确要求时才会接受
+        // AudioTrack 变速（media3 1.11.1 注释原话 "we only enable it this was specifically
+        // requested by the app"），而本机 HAL 对压缩流变速只"受理"不实现（实测静音），
+        // 所以这里不给它这个权限 —— 传进来的值上游一直是 false，写在这里是为了别被改回 true。
+        val askPlatformSpeed = false
         AudioDiag.log(
             "buildAudioSink #$sinkBuildCount (float=$enableFloatOutput " +
-                "playbackParams=$askPlatformSpeed anySpeedPassthrough=$passthroughAtAnySpeed)",
+                "upstreamPlaybackParams=$enableAudioOutputPlaybackParameters " +
+                "alwaysDecode=$alwaysDecodeToStereo)",
         )
         val sink = DefaultAudioSink.Builder(context)
             .setAudioCapabilities(forcedAudioCapabilities(context))
@@ -516,7 +507,11 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
                 ),
             )
             .build()
-        return PassthroughGateAudioSink(speedPcmMode, sink).also { gateSink = it }
+        return PassthroughGateAudioSink(speedPcmMode, sink).also { gate ->
+            // 全程 PCM 必须在第一次 configure 之前就位，否则首帧还是会走直通。
+            if (alwaysDecodeToStereo) gate.setForceDecode(true)
+            gateSink = gate
+        }
     }
 
     private var sinkBuildCount = 0

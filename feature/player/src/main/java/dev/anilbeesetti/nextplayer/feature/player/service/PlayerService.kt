@@ -156,6 +156,14 @@ class PlayerService : MediaSessionService() {
     private var audioTrackDisabledByUs = false
     private var audioTrackDisabledAtMs = 0L
 
+    /**
+     * 设置里的「始终解码成 PCM」。
+     *
+     * 建 player 时读取（sink 的输出配置构建时就定死了），改设置要重开播放器才生效。
+     * 打开后闸门常开：1 倍速也走 2 声道 PCM，好处是改速度不重建渲染器、完全不中断。
+     */
+    private var alwaysDecodeToStereo = false
+
     /** 本片源内已经重选过几次。超过 [AUDIO_RESELECT_MAX_PER_ITEM] 就放弃切换，保声音优先。 */
     private var audioReselectCount = 0
 
@@ -807,13 +815,10 @@ class PlayerService : MediaSessionService() {
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
 
-        // 通道 B（设置里的「倍速时保持直通」）：管线一律不动，速度直接交给平台。
-        // 只安排一次回读，看 AudioTrack 到底接受了多少速率 —— 这条路径能不能听，
-        // 完全取决于电视固件，日志里的 accepted 就是实测答案。
-        if (playerPreferences.passthroughAtAnySpeed) {
-            sink.setForceDecode(false)
-            reselectHandler.removeCallbacks(audioModeVerifyRunnable)
-            reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
+        // 设置里选了「始终解码成 PCM」：闸门打开就不再关上，速度全程由 Sonic 完成。
+        // 这样跨越 1 倍速不会重建音频渲染器，那 0.2 秒空档也就不存在了。
+        if (alwaysDecodeToStereo) {
+            sink.setForceDecode(true)
             return
         }
 
@@ -825,6 +830,22 @@ class PlayerService : MediaSessionService() {
         }
 
         val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
+
+        // 回到 1 倍速时不要立刻切回码流。用户在 1.0~1.x 之间连按时，每一次往返都要
+        // 重建音频渲染器、并让功放重新锁定格式，听感上就是"闪一下立体声"。
+        // 只在 1 倍速稳住 [BITSTREAM_RESTORE_DELAY_MS] 之后才切，连按期间一次都不切。
+        if (!wantDecode && !force) {
+            reselectHandler.removeCallbacks(bitstreamRestoreRunnable)
+            if (sink.forceDecode) {
+                AudioDiag.log(
+                    "audio mode: 1.0 已稳住，${BITSTREAM_RESTORE_DELAY_MS}ms 后再切回码流",
+                )
+                reselectHandler.postDelayed(bitstreamRestoreRunnable, BITSTREAM_RESTORE_DELAY_MS)
+            }
+            return
+        }
+        reselectHandler.removeCallbacks(bitstreamRestoreRunnable)
+
         val gateChanged = sink.setForceDecode(wantDecode)
         if (!gateChanged && !force) return
 
@@ -854,6 +875,12 @@ class PlayerService : MediaSessionService() {
         val speed = player.playbackParameters.speed
         val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
         if (sink.forceDecode == wantDecode) return
+        // 回到 1 倍速的纠正也要走"稳住之后再切"的延迟，否则 enforce 会把刚按下的
+        // [BITSTREAM_RESTORE_DELAY_MS] 缓冲直接跳过，连按速度时照样每次闪一下。
+        if (!wantDecode && sink.forceDecode) {
+            updateSpeedAudioMode(speed, force = false)
+            return
+        }
         val now = SystemClock.uptimeMillis()
         if (now - audioEnforceAtMs < AUDIO_ENFORCE_MIN_INTERVAL_MS) return
         audioEnforceAtMs = now
@@ -941,6 +968,22 @@ class PlayerService : MediaSessionService() {
             .build()
     }
 
+    /** 1 倍速稳住之后才切回码流，见 [updateSpeedAudioMode]。 */
+    private val bitstreamRestoreRunnable = Runnable {
+        val sink = speedAudioFactory?.gateSink ?: return@Runnable
+        val player = mediaSession?.player ?: return@Runnable
+        // 排队期间用户又提速了：保持解码，什么都不做
+        if (abs(player.playbackParameters.speed - 1f) > SPEED_UNITY_EPSILON) return@Runnable
+        if (!sink.forceDecode) return@Runnable
+        if (audioTrackDisabledByUs || audioRestartInFlight) {
+            // 正卡在另一次重选里，等它落地后再由 enforceAudioMode 收尾
+            reselectHandler.postDelayed(bitstreamRestoreRunnable, AUDIO_RESELECT_RESTORE_MS)
+            return@Runnable
+        }
+        AudioDiag.log("audio mode: 1.0 稳住，切回码流")
+        updateSpeedAudioMode(player.playbackParameters.speed, force = true)
+    }
+
     /**
      * 事后校验：实际管线与速度要求不符就重试，最多 [AUDIO_MODE_MAX_RETRIES] 次。
      * 无论结论如何，先把音轨恢复掉，避免静音。
@@ -951,18 +994,8 @@ class PlayerService : MediaSessionService() {
         audioRestartInFlight = false
         restoreAudioTrackType("verify")
 
-        // 通道 B：压缩码流保持，速率交给 AudioTrack。
-        // 注意 DefaultAudioSink.playbackParameters 只是"我们请求的值"，不是 AudioTrack 回读值
-        // （真正的回读在 AudioTrackAudioOutput.setPlaybackParameters 里，只喂给位置追踪器，
-        // 不对外暴露）。所以这里只能记 requested，平台到底接没接受要看两条外部信号：
-        //   1) logcat 里 "Failed to set playback params"（AudioTrack 抛 IllegalArgumentException）
-        //   2) 播放中 dumpsys media.audio_flinger 里那条 direct/IEC61937 输出线程的实际样本率
-        if (playerPreferences.passthroughAtAnySpeed) {
-            AudioDiag.log(
-                "passthrough speed: requested=${player.playbackParameters.speed} " +
-                    "sinkSpeed=${sink.playbackParameters.speed} " +
-                    "passthrough=${sink.isPassthrough}",
-            )
+        // 「始终解码」模式下管路全程不变，没有任何东西需要校验。
+        if (alwaysDecodeToStereo) {
             audioModeRetries = 0
             return@Runnable
         }
@@ -1045,8 +1078,7 @@ class PlayerService : MediaSessionService() {
      */
     private fun shouldManageAudioPipeline(): Boolean {
         val sink = speedAudioFactory?.gateSink ?: return false
-        // 通道 B：用户选择"倍速也保持直通"，按速度切管线这条路整个不参与。
-        if (playerPreferences.passthroughAtAnySpeed) return false
+        if (alwaysDecodeToStereo) return false
         if (sink.passthroughEverSeen || sink.isPassthrough) return true
         val mime = selectedAudioMime() ?: return false
         return mime in PASSTHROUGH_MIME_TYPES
@@ -1069,9 +1101,10 @@ class PlayerService : MediaSessionService() {
             setDecoderManager(decoderManager)
             // sink 的输出配置在建 player 时定死，所以这里是唯一能设进去的时机。
             // 改设置后重开播放器生效（设置页里已写明）。
-            passthroughAtAnySpeed = playerPreferences.passthroughAtAnySpeed
-            AudioDiag.log("speed audio mode: anySpeedPassthrough=$passthroughAtAnySpeed")
+            alwaysDecodeToStereo = playerPreferences.alwaysDecodeToStereo
+            AudioDiag.log("speed audio mode: alwaysDecodeToStereo=$alwaysDecodeToStereo")
         }
+        this@PlayerService.alwaysDecodeToStereo = playerPreferences.alwaysDecodeToStereo
         speedAudioFactory = renderersFactory
 
         trackSelector = DefaultTrackSelector(applicationContext).apply {
@@ -1530,6 +1563,15 @@ private const val AUDIO_RESELECT_RESTORE_MS = 250L
 
 /** 重选完成后等多久校验实际状态（给渲染器、AudioTrack 留出初始化时间）。 */
 private const val AUDIO_MODE_VERIFY_DELAY_MS = 700L
+
+/**
+ * 回到 1 倍速后等多久才切回压缩码流。
+ *
+ * 切回码流要重建音频渲染器（本机实测约 0.2 秒空档），功放还会重新锁定格式。
+ * 用户在 1.0~1.x 之间连按速度时，每次往返都切一次就是连续的"闪一下立体声"。
+ * 缓 3 秒再切：连按期间一次都不切，只在真正停下 1 倍速时才恢复 5.1 直通。
+ */
+private const val BITSTREAM_RESTORE_DELAY_MS = 3000L
 
 /** 校验不通过时最多重试几次（重试会再断一次声音，不宜多）。 */
 private const val AUDIO_MODE_MAX_RETRIES = 1

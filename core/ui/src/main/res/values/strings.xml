@@ -208,8 +208,8 @@
     <string name="properties">Properties</string>
     <string name="volume_boost">Volume boost</string>
     <string name="volume_boost_desc">Boost audio volume up to 200%</string>
-    <string name="passthrough_any_speed">Bitstream at any speed (experimental)</string>
-    <string name="passthrough_any_speed_desc">Off: any speed other than 1x is decoded to 2-channel PCM, so pitch stays natural. On: the compressed stream keeps going to the receiver at every speed and the TV is left to handle the speed itself — depends entirely on the TV firmware and may sound broken or drift out of sync. Takes effect the next time the player opens.</string>
+    <string name="always_decode_to_stereo">Always decode to stereo PCM</string>
+    <string name="always_decode_to_stereo_desc">Off: at 1x the compressed stream still goes straight to the receiver (real 5.1 / Atmos), and any other speed is decoded to 2-channel PCM. Crossing 1x rebuilds the audio path once, so you hear a brief gap. On: the whole session stays on PCM — changing speed never interrupts, but 1x is also 2-channel. Takes effect the next time the player opens.</string>
     <string name="open_audio">Open local audio</string>
     <string name="error_opening_audio">Can’t open this audio file</string>
     <string name="open_subtitle">Open local subtitle</string>
