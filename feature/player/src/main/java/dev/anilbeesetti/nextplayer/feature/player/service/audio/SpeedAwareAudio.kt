@@ -497,14 +497,17 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
                 "upstreamPlaybackParams=$enableAudioOutputPlaybackParameters " +
                 "alwaysDecode=$alwaysDecodeToStereo)",
         )
-        val sink = DefaultAudioSink.Builder(context)
-            .setAudioCapabilities(forcedAudioCapabilities(context))
+        val builder = DefaultAudioSink.Builder(context)
+        // 对齐 just-plus-player（电视上实测能跟着倍速动态切换的那版）的做法：
+        // 默认采信**路由自己报的能力**，只有路由什么压缩格式都不报时才伪造兜底。
+        // 造假能力的代价是 media3 不再监听热插拔（Builder(context) 会注册路由能力回调，
+        // 被 setAudioCapabilities 覆盖掉就等于宣布"我不信路由的答案"）。
+        sinkCapabilities(context)?.let { builder.setAudioCapabilities(it) }
+        val sink = builder
             .setEnableFloatOutput(enableFloatOutput)
             .setEnableAudioOutputPlaybackParameters(askPlatformSpeed)
-            .setAudioProcessorChain(
-                DefaultAudioSink.DefaultAudioProcessorChain(
-                    DownmixToStereoAudioProcessor(routePcmChannels),
-                ),
+            .setAudioProcessors(
+                arrayOf(DownmixToStereoAudioProcessor(routePcmChannels)),
             )
             .build()
         return PassthroughGateAudioSink(speedPcmMode, sink).also { gate ->
@@ -606,6 +609,25 @@ private fun isHardwareCodec(info: MediaCodecInfo): Boolean {
         name.startsWith("c2.android.") ||
         name.contains("software", ignoreCase = true)
     return !software
+}
+
+/**
+ * 需要伪造 [AudioCapabilities] 时才返回非 null，否则交给 media3 用路由自己的答案。
+ *
+ * 判定只看一件事：路由报不报得出 AC3 / E-AC3。
+ * - 报得出（本机就是这样，`system reported ...` 里带着 5=AC3、6=E-AC3）→ 返回 null，
+ *   builder 保持 `Builder(context)` 的能力监听，热插拔照旧；
+ * - 报不出 → 直通永远不会发生，这时才用 [forcedAudioCapabilities] 兜底。
+ */
+@UnstableApi
+fun sinkCapabilities(context: Context): AudioCapabilities? {
+    val caps = AudioCapabilities.getCapabilities(context)
+    val routeKnowsAc3 = caps.supportsEncoding(AudioFormat.ENCODING_AC3) ||
+        caps.supportsEncoding(AudioFormat.ENCODING_E_AC3)
+    AudioDiag.log(
+        "sink capabilities: ${if (routeKnowsAc3) "as the route reports" else "forced"} ($caps)",
+    )
+    return if (routeKnowsAc3) null else forcedAudioCapabilities(context)
 }
 
 /**

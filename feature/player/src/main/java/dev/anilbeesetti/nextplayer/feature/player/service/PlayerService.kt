@@ -1197,11 +1197,10 @@ class PlayerService : MediaSessionService() {
             }
             player.clearMediaItems()
             player.stop()
-            // 主动解绑视频输出：本机 4K 硬解组件（OMX.MS.DOLBY_VISION / HEVC）是单实例，
-            // 上面 stop() 只是停播放，解码器释放可能拖到 service 真正销毁才发生。
-            // 用户"退出后马上再播"就会撞上旧解码器没释放，start 阶段直接失败。
-            runCatching { player.clearVideoSurface() }
-                .onFailure { AudioDiag.log("clearVideoSurface failed: $it") }
+            // 这里一度调过 clearVideoSurface()，想让 4K 硬解器早点释放，但本机固件上
+            // MediaCodecVideoRenderer 等不到 surface 解绑（实测 22:34 在 1.4 倍速下抛
+            // ERROR_CODE_TIMEOUT "Detaching surface timed out." 直接弹播放错误面），
+            // 而紧接着的 onDestroy → player.release() 本来就会释放解码器，所以删掉。
         }
         stopSelf()
     }
