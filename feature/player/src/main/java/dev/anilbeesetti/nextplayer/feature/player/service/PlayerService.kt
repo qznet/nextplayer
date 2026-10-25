@@ -951,13 +951,16 @@ class PlayerService : MediaSessionService() {
         audioRestartInFlight = false
         restoreAudioTrackType("verify")
 
-        // 通道 B 的回读：accepted 是 AudioTrack 承认的速率。
-        // asked≠accepted 说明平台拒绝了变速（media3 会吞掉 IllegalArgumentException），
-        // 此时声音仍按 1 倍速走、画面按 requested 走 —— 音画必然漂移。
+        // 通道 B：压缩码流保持，速率交给 AudioTrack。
+        // 注意 DefaultAudioSink.playbackParameters 只是"我们请求的值"，不是 AudioTrack 回读值
+        // （真正的回读在 AudioTrackAudioOutput.setPlaybackParameters 里，只喂给位置追踪器，
+        // 不对外暴露）。所以这里只能记 requested，平台到底接没接受要看两条外部信号：
+        //   1) logcat 里 "Failed to set playback params"（AudioTrack 抛 IllegalArgumentException）
+        //   2) 播放中 dumpsys media.audio_flinger 里那条 direct/IEC61937 输出线程的实际样本率
         if (playerPreferences.passthroughAtAnySpeed) {
             AudioDiag.log(
-                "passthrough speed: asked=${player.playbackParameters.speed} " +
-                    "accepted=${sink.playbackParameters.speed} " +
+                "passthrough speed: requested=${player.playbackParameters.speed} " +
+                    "sinkSpeed=${sink.playbackParameters.speed} " +
                     "passthrough=${sink.isPassthrough}",
             )
             audioModeRetries = 0
