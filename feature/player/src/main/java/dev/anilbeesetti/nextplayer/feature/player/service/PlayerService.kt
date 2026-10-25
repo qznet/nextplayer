@@ -227,6 +227,24 @@ class PlayerService : MediaSessionService() {
                 "Video tracks: ${videoTracks.ifEmpty { "none" }}, " +
                     "unmapped=${trackSelector.unmappedTrackCount(C.TRACK_TYPE_VIDEO)}",
             )
+            // 音频轨的选择结果必须落盘：出现"有画面没声音"时，第一件事就是看这条音轨
+            // 到底有没有被选中（supported=false / selected=false 与"选中了但 sink 没 configure"
+            // 是完全不同的两种故障）。
+            val audioTracks = tracks.groups
+                .filter { it.type == C.TRACK_TYPE_AUDIO }
+                .joinToString { group ->
+                    val format = group.mediaTrackGroup.getFormat(0)
+                    "${format.sampleMimeType}(${format.channelCount}ch/" +
+                        "${format.sampleRate}Hz supported=${group.isSupported(true)}" +
+                        " selected=${group.isSelected})"
+                }
+            val sink = speedAudioFactory?.gateSink
+            AudioDiag.log(
+                "tracks: audio=${audioTracks.ifEmpty { "none" }} " +
+                    "unmapped=${trackSelector.unmappedTrackCount(C.TRACK_TYPE_AUDIO)} " +
+                    "gate=${sink?.forceDecode} passthrough=${sink?.isPassthrough} " +
+                    "alwaysDecode=$alwaysDecodeToStereo",
+            )
         }
 
         override fun onRenderedFirstFrame(
@@ -812,13 +830,33 @@ class PlayerService : MediaSessionService() {
      * 另外速度回调本身也可能漏（播放器重建后 speed 回到 1.0 而闸门还停在解码态），
      * 所以还有 [enforceAudioMode] 在关键时机按当前 speed 强制对齐。
      */
+    /**
+     * 闸门此刻**应该**处于的状态——唯一判据。
+     *
+     * 这里曾经是每个入口各自算一遍：`updateSpeedAudioMode` 认为「始终解码」时闸门恒开，
+     * 而 `enforceAudioMode` 走 `shouldManageAudioPipeline()`（它在始终解码模式下返回 false）
+     * 于是把闸门关回去。两者每隔 2~3 秒互相覆盖一次（实测 22:42:28→22:43:19 日志里
+     * `gate: forceDecode` 来回翻了 8 次），每次翻转都重选音轨、重建音频渲染器——
+     * 听感就是吞字、卡顿，严重时直接没声音。所以只能有一个判据。
+     *
+     * - 「始终解码为 2 声道」：能解码就恒为 true（1 倍速也不放行码流，来回改速度零重建）；
+     *   解不了就别拦（宁可速度不生效也不能静音）。
+     * - 否则：非 1 倍速且这条音轨能解码 → true。
+     */
+    private fun desiredGateDecode(): Boolean {
+        if (alwaysDecodeToStereo) return canDecodeSelectedAudio()
+        val player = mediaSession?.player ?: return false
+        val speed = player.playbackParameters.speed
+        return abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
+    }
+
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
 
         // 设置里选了「始终解码成 PCM」：闸门打开就不再关上，速度全程由 Sonic 完成。
         // 这样跨越 1 倍速不会重建音频渲染器，那 0.2 秒空档也就不存在了。
         if (alwaysDecodeToStereo) {
-            sink.setForceDecode(true)
+            sink.setForceDecode(canDecodeSelectedAudio())
             return
         }
 
@@ -829,8 +867,7 @@ class PlayerService : MediaSessionService() {
             return
         }
 
-        val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
-
+        val wantDecode = desiredGateDecode()
         // 回到 1 倍速时不要立刻切回码流。用户在 1.0~1.x 之间连按时，每一次往返都要
         // 重建音频渲染器、并让功放重新锁定格式，听感上就是"闪一下立体声"。
         // 只在 1 倍速稳住 [BITSTREAM_RESTORE_DELAY_MS] 之后才切，连按期间一次都不切。
@@ -867,13 +904,25 @@ class PlayerService : MediaSessionService() {
         val sink = speedAudioFactory?.gateSink ?: return
         val player = mediaSession?.player ?: return
         // 重选进行中不要抢跑：此刻闸门本来就可能与渲染器状态错位，纠正只会打架
-        if (audioTrackDisabledByUs || audioRestartInFlight) return
+        if (audioTrackDisabledByUs || audioRestartInFlight) {
+            // 但卡住时必须能自愈：音轨被我们禁用后若一直没恢复，整场播放都会静音
+            // （实测 22:43 那次会话音频 sink 一次都没 configure，ARC 从 22:43 起再无写入）。
+            if (audioTrackDisabledByUs &&
+                SystemClock.uptimeMillis() - audioTrackDisabledAtMs > AUDIO_WATCHDOG_GRACE_MS
+            ) {
+                restoreAudioTrackType("enforce-stuck")
+            }
+            return
+        }
+        // 「始终解码」模式下没有"按速度切管线"这回事，闸门由 updateSpeedAudioMode 独占，
+        // 这里再插手就会和它互相覆盖（曾经每 2~3 秒翻一次闸门，音频被反复重建）。
+        if (alwaysDecodeToStereo) return
         if (!shouldManageAudioPipeline()) {
             sink.setForceDecode(false)
             return
         }
         val speed = player.playbackParameters.speed
-        val wantDecode = abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
+        val wantDecode = desiredGateDecode()
         if (sink.forceDecode == wantDecode) return
         // 回到 1 倍速的纠正也要走"稳住之后再切"的延迟，否则 enforce 会把刚按下的
         // [BITSTREAM_RESTORE_DELAY_MS] 缓冲直接跳过，连按速度时照样每次闪一下。
@@ -1104,6 +1153,9 @@ class PlayerService : MediaSessionService() {
             // sink 的输出配置在建 player 时定死，所以这里是唯一能设进去的时机。
             // 改设置后重开播放器生效（设置页里已写明）。
             alwaysDecodeToStereo = playerPreferences.alwaysDecodeToStereo
+            // 闸门只拦「真能解码」的格式：本机 ARC 不认 DTS/TrueHD，平台也没有对应解码器，
+            // 拦掉它们等于把这条音轨变成静音（开关启用后有的视频没声音就是这么来的）。
+            decodeCheck = { mime -> mime == null || canDecodeAudioMime(mime, decoderManager.audioMode) }
             AudioDiag.log("speed audio mode: alwaysDecodeToStereo=$alwaysDecodeToStereo")
         }
         this@PlayerService.alwaysDecodeToStereo = playerPreferences.alwaysDecodeToStereo

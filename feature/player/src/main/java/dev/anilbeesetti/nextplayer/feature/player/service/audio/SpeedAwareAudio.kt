@@ -120,6 +120,20 @@ class PassthroughGateAudioSink(
 
     private val deniedMimes = CopyOnWriteArraySet<String>()
 
+    /**
+     * 这条 mime 在本机**到底能不能解码**（由 service 按当前解码器模式注入）。
+     *
+     * 闸门只应该拦「能解码但不想直通」的格式。拦掉一条根本没有解码器的音轨
+     * （本机 ARC 不认 DTS / DTS-HD / TrueHD，平台也没有对应解码器）等于把它变成静音——
+     * 这正是「开关启用后有的视频没声音」的原因：宁可保留直通（或直接不支持），也不能装成
+     * 能解码却送不出一个采样。
+     */
+    @Volatile
+    var decodeCheck: ((String?) -> Boolean)? = null
+
+    /** [decodeCheck] 的备忘：supportsFormat 会被问很多次，别每次都翻一遍 MediaCodecList。 */
+    private val decodeCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
     /** 当前 AudioTrack 是否在以压缩码流直通。 */
     @Volatile
     var isPassthrough: Boolean = false
@@ -203,7 +217,17 @@ class PassthroughGateAudioSink(
     private fun refused(format: Format): Boolean {
         val mimeType = format.sampleMimeType
         if (mimeType != null && deniedMimes.contains(mimeType)) return true
-        return mode.forceDecode && isCompressed(format)
+        if (!mode.forceDecode || !isCompressed(format)) return false
+        // 拦了就必须能解码：解不出来的格式继续走直通，宁可速度不生效也不能静音。
+        val check = decodeCheck ?: return true
+        val known = mimeType?.let { decodeCache[it] }
+        if (known != null) return known
+        val decodable = check(mimeType)
+        if (mimeType != null) decodeCache[mimeType] = decodable
+        if (!decodable) {
+            AudioDiag.log("gate: $mimeType 本机解不出来，继续允许直通（不拦）")
+        }
+        return decodable
     }
 
     private fun isCompressed(format: Format): Boolean {
@@ -462,6 +486,10 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
     @Volatile
     var alwaysDecodeToStereo: Boolean = false
 
+    /** 「这条 mime 在本机能不能解码」，由 service 按当前解码器模式注入，闸门据此决定拦不拦。 */
+    @Volatile
+    var decodeCheck: ((String?) -> Boolean)? = null
+
     var gateSink: PassthroughGateAudioSink? = null
         private set
 
@@ -511,6 +539,7 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
             )
             .build()
         return PassthroughGateAudioSink(speedPcmMode, sink).also { gate ->
+            gate.decodeCheck = decodeCheck
             // 全程 PCM 必须在第一次 configure 之前就位，否则首帧还是会走直通。
             if (alwaysDecodeToStereo) gate.setForceDecode(true)
             gateSink = gate
