@@ -971,7 +971,12 @@ class PlayerService : MediaSessionService() {
         val wantPassthrough = abs(speed - 1f) <= SPEED_UNITY_EPSILON
         if (sink.isPassthrough == wantPassthrough) {
             audioModeRetries = 0
-            AudioDiag.log("audio mode: verified ${audioModeName(wantPassthrough)} at $speed")
+            // sink speed 是音频管线**自己**认的速率：解码态由 Sonic 落地，直通态恒为 1.0。
+            // 它和 player speed 不一致，就说明声音没跟上画面（音画会持续漂移）。
+            AudioDiag.log(
+                "audio mode: verified ${audioModeName(wantPassthrough)} at $speed " +
+                    "(sink speed=${sink.playbackParameters.speed} mime=${sink.lastConfiguredMime})",
+            )
             return@Runnable
         }
         if (audioModeRetries >= AUDIO_MODE_MAX_RETRIES) {
