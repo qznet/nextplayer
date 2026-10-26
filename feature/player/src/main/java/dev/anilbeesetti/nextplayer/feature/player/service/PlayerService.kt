@@ -1634,10 +1634,6 @@ class PlayerService : MediaSessionService() {
                 }
                 player.replaceMediaItem(player.currentMediaItemIndex, updatedItem)
             }
-            player.replaceMediaItem(
-                player.currentMediaItemIndex,
-                updatedItem,
-            )
         } else {
             AudioDiag.log("decoder fallback: $trackType -> $mode (not persisted)")
         }
