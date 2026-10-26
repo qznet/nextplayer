@@ -511,25 +511,19 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         enableAudioOutputPlaybackParameters: Boolean,
     ): AudioSink? {
         sinkBuildCount++
-        // 直通分支要接受 AudioTrack 变速（**恢复 2026-10-26 22:02 之前的行为**）。
+        // 直通分支**不给** AudioTrack 变速的权限（恒 false）。
         //
-        // media3 1.11.1 的 AudioTrackAudioOutputProvider，passthrough 分支：
-        //   // Passthrough only supports audio output playback parameters, but we only enable it
-        //   // this was specifically requested by the app.
-        //   usePlaybackParameters = formatConfig.enablePlaybackParameters;
-        // 也就是说**只要 app 主动要**（传 true），直通态的 AudioTrack 就会收到 speed。
-        //
-        // 本机实测效果：码流仍按压缩格式交给 HAL，但 HAL 走混音输出，音频按变速率
-        // 播放 —— 音调会变（码流无法保音调地拉伸），但**音画同步**，
-        // 功放那边显示也跟着变成 2 声道/立体声。这正是最初要的效果。
-        //
-        // 代价：HAL 自己的折混不留余量（5.1 满幅求和可达 1.2 倍满刻度），大动态素材
-        // 可能削顶；应用侧的下混（DownmixToStereoAudioProcessor）在直通态不参与。
-        val askPlatformSpeed = true
+        // 2026-10-25 实机结论（本机 TCL/雷鸟 m7642 / Android 9）：
+        // 打开后 AudioTrack 确实会接受变速请求，但音频 HAL 对
+        // set_playback_rate_parameters(IEC61937) 只"受理"不实现 ——
+        // 结果是**完全静音**（功放保持最后一次显示，声音没了）。
+        // 所以压缩码流要"能调速"，只有一条路：解码成 2 声道 PCM，由 Sonic 拉伸
+        // （见 PlayerService.desiredGateDecode）。这里保持 false，不要改回 true。
+        val askPlatformSpeed = false
         AudioDiag.log(
             "buildAudioSink #$sinkBuildCount (float=$enableFloatOutput " +
                 "upstreamPlaybackParams=$enableAudioOutputPlaybackParameters " +
-                "passthroughSpeed=always)",
+                "platformSpeed=off)",
         )
         val builder = DefaultAudioSink.Builder(context)
         // 对齐 just-plus-player（电视上实测能跟着倍速动态切换的那版）的做法：

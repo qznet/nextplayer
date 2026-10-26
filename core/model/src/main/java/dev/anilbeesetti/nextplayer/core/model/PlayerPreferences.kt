@@ -51,15 +51,6 @@ data class PlayerPreferences(
     val showSystemVolumePanel: Boolean = true,
     val enableVolumeBoost: Boolean = false,
 
-    /**
-     * 已停用，只为兼容旧设置文件保留（旧版本可能已把它存成 true）。
-     *
-     * 2026-10-25 实机结论：打开后 AudioTrack 会接受变速请求、功放保持最后一次显示，但
-     * **完全静音** —— 这台电视（TCL/雷鸟 m7642，Android 9）的音频 HAL 对
-     * `set_playback_rate_parameters(IEC61937)` 只"受理"不实现。该分支已从逻辑里摘除，
-     * 无论存的是什么都按 false 处理，界面上也不再暴露。
-     */
-    val passthroughAtAnySpeed: Boolean = false,
 
 
     // Subtitle Preferences

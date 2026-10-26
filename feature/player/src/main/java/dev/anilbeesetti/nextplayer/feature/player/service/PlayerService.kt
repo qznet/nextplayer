@@ -979,28 +979,58 @@ class PlayerService : MediaSessionService() {
      *   （解不了就别拦，宁可速度不生效也不能静音）。
      * - 关闭（默认）：恒为 false —— 全程直通，调速不动音频通路。
      */
-    private fun desiredGateDecode(): Boolean = false
+    private fun desiredGateDecode(): Boolean {
+        val player = mediaSession?.player ?: return false
+        val speed = player.playbackParameters.speed
+        return abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
+    }
 
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
 
-        // 直通优先（2026-10-26 定案）：调速**不**再把音轨降级成 2 声道 PCM。
-        //
-        // 降级那条路（OFFLOAD/E_AC3 6ch → MIXER/PCM_16_BIT 2ch）在 flinger 层与
-        // just-plus-player 逐位一致，但电视的 Dolby 链（Dolby bypass: 0）仍把 PCM
-        // 升混重编码成杜比：功放照样显示 Atmos、听感也仍是环绕声，等于没换，
-        // 还要多付一次音频渲染器重建（跨越 1 倍速时那声"闪一下立体声"）。
-        //
-        // 现在压缩码流一路直通到底：功放一直是真正的 5.1 / Atmos，
-        // 变速交给 AudioTrack（sink 的 askPlatformSpeed）——码流无法保音调地拉伸，
-        // 所以音调会变，但音画是同步的。
-        //
-        // 这里只负责把"上一轮遗留的 PCM 态"收回直通。
-        if (sink.forceDecode) {
-            AudioDiag.log("audio mode: back to pass-through at $speed")
+        // PCM 源（AAC / MP3 / FLAC / Opus…）本来就是 PCM 出去，变速由 Sonic 完成，
+        // 重选音轨只会白重建一次音频渲染器（听感上就是每次调速度都断一下）。
+        if (!shouldManageAudioPipeline()) {
             sink.setForceDecode(false)
-            requestAudioReselect("back to passthrough")
+            return
         }
+
+        val wantDecode = desiredGateDecode()
+        // 回到 1 倍速时不要立刻切回码流。用户在 1.0~1.x 之间连按时，每一次往返都要
+        // 重建音频渲染器、并让功放重新锁定格式，听感上就是"闪一下立体声"。
+        // 只在 1 倍速稳住 [BITSTREAM_RESTORE_DELAY_MS] 之后才切，连按期间一次都不切。
+        if (!wantDecode && !force) {
+            reselectHandler.removeCallbacks(bitstreamRestoreRunnable)
+            if (sink.forceDecode) {
+                AudioDiag.log(
+                    "audio mode: 1.0 已稳住，${BITSTREAM_RESTORE_DELAY_MS}ms 后再切回码流",
+                )
+                reselectHandler.postDelayed(bitstreamRestoreRunnable, BITSTREAM_RESTORE_DELAY_MS)
+            }
+            return
+        }
+        reselectHandler.removeCallbacks(bitstreamRestoreRunnable)
+
+        // 音频解码器保持 AUTO（系统 Dolby 硬解）：参照物 just-plus-player 在倍速时
+        // 就是这么干的——它没有 FFmpeg，用 media3 标准的 MediaCodecAudioRenderer
+        // 把 E-AC3 解成 PCM 输出，实测 HAL 侧是 'MIXER + PCM_16_BIT + 2ch'。
+        val gateChanged = sink.setForceDecode(wantDecode)
+        if (!gateChanged && !force) return
+
+        val wantPassthrough = !wantDecode
+        if (!gateChanged && sink.isPassthrough == wantPassthrough) {
+            audioModeRetries = 0
+            return
+        }
+        AudioDiag.log(
+            "audio mode: want ${audioModeName(wantPassthrough)} at $speed " +
+                "(gateChanged=$gateChanged actual=${audioModeName(sink.isPassthrough)})",
+        )
+        audioModeRetries = 0
+        requestAudioReselect("speed=$speed")
+        // 切到 PCM 之后把 LoudnessEnhancer 挂上：直通态音频在 offload 线程上挂不了
+        // effect，切到 PCM（MIXER 线程）才是它能待的地方。
+        if (wantDecode) ensureLoudnessEnhancer()
     }
 
     /** 事件驱动对齐：任何时刻发现闸门与当前速度不符就纠正，不依赖速度回调是否来过。 */
@@ -1018,15 +1048,24 @@ class PlayerService : MediaSessionService() {
             }
             return
         }
-        // 「调速时降级为 2 声道 PCM」关闭（默认）：闸门不该开，只把遗留的 PCM 态收回直通。
-        // 打开：按当前速度纠正闸门（这是唯一的判据，避免多个入口互相覆盖）。
+        if (!shouldManageAudioPipeline()) {
+            sink.setForceDecode(false)
+            return
+        }
+        val speed = player.playbackParameters.speed
         val wantDecode = desiredGateDecode()
         if (sink.forceDecode == wantDecode) return
+        // 回到 1 倍速的纠正也要走"稳住之后再切"的延迟，否则 enforce 会把刚按下的
+        // [BITSTREAM_RESTORE_DELAY_MS] 缓冲直接跳过，连按速度时照样每次闪一下。
+        if (!wantDecode && sink.forceDecode) {
+            updateSpeedAudioMode(speed, force = false)
+            return
+        }
         val now = SystemClock.uptimeMillis()
         if (now - audioEnforceAtMs < AUDIO_ENFORCE_MIN_INTERVAL_MS) return
         audioEnforceAtMs = now
-        AudioDiag.log("audio mode: out of sync ($reason) gate=${sink.forceDecode}")
-        updateSpeedAudioMode(player.playbackParameters.speed, force = true)
+        AudioDiag.log("audio mode: out of sync ($reason) gate=${sink.forceDecode} speed=$speed")
+        updateSpeedAudioMode(speed, force = true)
     }
 
     private fun requestAudioReselect(reason: String) {
