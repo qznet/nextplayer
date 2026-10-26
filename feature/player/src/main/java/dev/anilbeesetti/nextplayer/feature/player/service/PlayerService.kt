@@ -132,6 +132,9 @@ class PlayerService : MediaSessionService() {
     private var loudnessEnhancer: LoudnessEnhancer? = null
     private var currentVolumeGain: Int = 0
 
+    /** [LoudnessEnhancer] 当前挂在哪个 audio session 上（0 = 未挂）。 */
+    private var enhancerSessionId: Int = 0
+
     private lateinit var decoderManager: DecoderManager
     private lateinit var trackSelector: DefaultTrackSelector
     private var speedAudioFactory: SpeedAwareRenderersFactory? = null
@@ -592,18 +595,48 @@ class PlayerService : MediaSessionService() {
 
         override fun onAudioSessionIdChanged(audioSessionId: Int) {
             super.onAudioSessionIdChanged(audioSessionId)
-            if (!playerPreferences.enableVolumeBoost) return
             if (audioSessionId == C.AUDIO_SESSION_ID_UNSET) return
-            try {
-                loudnessEnhancer?.release()
-                loudnessEnhancer = LoudnessEnhancer(audioSessionId)
-                if (currentVolumeGain > 0) {
-                    setEnhancerTargetGain(gain = currentVolumeGain)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                loudnessEnhancer = null
-            }
+            ensureLoudnessEnhancer(audioSessionId)
+        }
+    }
+
+    /**
+     * 确保 [LoudnessEnhancer] 挂在当前 audio session 上（幂等）。
+     *
+     * 为什么要挂：实测（2026-10-26，同机同片源对比 just-plus-player）两者送进 HAL 的
+     * 音频流逐位相同（per-track flags / format / chn mask / srate 全一致），唯一差别是
+     * just+ 的 MIXER 线程上有 1 条 Effect Chain：
+     *   Effect ID 19  UUID fa415329-…  name: Loudness Enhancer（AOSP 内置）
+     * 而我们没有这条 chain —— 旧代码在 `enableVolumeBoost` 为 false 时直接 return，
+     * 从来没创建过这个 effect。电视的 Dolby 链在 bypass=0 时会把 2ch PCM 升混重编码成
+     * 杜比，功放于是永远显示"透传"；有这条 effect chain 时走的是 MIXER+effect 路径，
+     * 这很可能就是"功放显示能否跟随 PCM 声道数"的分水岭。
+     *
+     * 必须在**切到 PCM 之后**也能重建：1.0 倍速直通时音频走 offload 线程，
+     * offload 通道不允许挂 effect，创建会抛异常；切回 PCM 时 session 不变，
+     * 不会再次触发 [onAudioSessionIdChanged]，所以切速时要主动调一次。
+     */
+    private fun ensureLoudnessEnhancer(audioSessionId: Int = 0) {
+        val player = mediaSession?.player ?: return
+        val sessionId = if (audioSessionId != 0) audioSessionId else player.audioSessionId
+        if (sessionId == C.AUDIO_SESSION_ID_UNSET) return
+        if (loudnessEnhancer != null && enhancerSessionId == sessionId) return
+        try {
+            loudnessEnhancer?.release()
+            loudnessEnhancer = LoudnessEnhancer(sessionId)
+            enhancerSessionId = sessionId
+            // 关闭"音量增强"时用 gain=0（不提升音量，只让 effect 留在链上），
+            // 与 just-plus-player 的行为一致。
+            val gain = if (playerPreferences.enableVolumeBoost) currentVolumeGain else 0
+            setEnhancerTargetGain(gain = gain)
+            AudioDiag.log(
+                "loudness enhancer: session=$sessionId gain=$gain " +
+                    "boost=${playerPreferences.enableVolumeBoost}",
+            )
+        } catch (e: Exception) {
+            AudioDiag.log("loudness enhancer failed: $e")
+            loudnessEnhancer = null
+            enhancerSessionId = 0
         }
     }
 
@@ -612,7 +645,11 @@ class PlayerService : MediaSessionService() {
 
         try {
             enhancer.setTargetGain(gain)
-            enhancer.enabled = gain > 0
+            // 一直保持 enabled：LoudnessEnhancer 只要挂在 session 上，AudioFlinger 就会
+            // 为这条轨建立 Effect Chain（MIXER 路径）。just-plus-player 也是这么做的
+            // ——它创建完 LoudnessEnhancer 后没有再关掉它。
+            // gain=0 表示不做任何增益，只是让 effect 留在链上。
+            enhancer.enabled = true
             currentVolumeGain = enhancer.targetGain.toInt()
         } catch (e: Exception) {
             e.printStackTrace()
@@ -1036,6 +1073,10 @@ class PlayerService : MediaSessionService() {
         )
         audioModeRetries = 0
         requestAudioReselect("speed=$speed")
+        // 切到 PCM 之后把 LoudnessEnhancer 挂上：直通态音频在 offload 线程上挂不了
+        // effect，切到 PCM（MIXER 线程）才是它能待的地方 —— 这条 Effect Chain 关系到
+        // 功放显示能不能跟着声道数变，见 ensureLoudnessEnhancer 的说明。
+        if (wantDecode) ensureLoudnessEnhancer()
     }
 
     /** 事件驱动对齐：任何时刻发现闸门与当前速度不符就纠正，不依赖速度回调是否来过。 */
