@@ -41,12 +41,20 @@ internal fun rememberPlayerKeyInputState(
 ): PlayerKeyInputState {
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current.applicationContext
-    val state = remember(player, controls, seekIncrementMs) {
-        PlayerKeyInputState(player, controls, seekIncrementMs, coroutineScope, context)
+    val state = remember(
+        player,
+        controls,
+        seekIncrementMs,
+    ) {
+        PlayerKeyInputState(
+            player = player,
+            controls = controls,
+            seekIncrementMs = seekIncrementMs,
+            coroutineScope = coroutineScope,
+            context = context,
+        )
     }
-    DisposableEffect(state) {
-        onDispose { state.cancelPendingReset() }
-    }
+    DisposableEffect(key1 = state) { onDispose { state.cancelPendingReset() } }
     return state
 }
 
@@ -58,13 +66,13 @@ internal class PlayerKeyInputState(
     private val coroutineScope: CoroutineScope,
     private val context: Context,
 ) {
-    var isSeeking: Boolean by mutableStateOf(false)
+    var isSeeking: Boolean by mutableStateOf(value = false)
         private set
 
-    var seekOffsetMs: Long by mutableLongStateOf(0L)
+    var seekOffsetMs: Long by mutableLongStateOf(value = 0L)
         private set
 
-    var seekPositionMs: Long by mutableLongStateOf(0L)
+    var seekPositionMs: Long by mutableLongStateOf(value = 0L)
         private set
 
     private var resetJob: Job? = null
@@ -80,7 +88,11 @@ internal class PlayerKeyInputState(
         if (controls.controlsLocked) {
             return when (keyEvent.key) {
                 Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
-                    if (controls.controlsVisible) controls.unlockControls() else controls.showControls()
+                    if (controls.controlsVisible) {
+                        controls.unlockControls()
+                    } else {
+                        controls.showControls()
+                    }
                     true
                 }
 
@@ -93,8 +105,14 @@ internal class PlayerKeyInputState(
 
         fun seekBy(deltaMs: Long) {
             val duration = player.duration
-            val target = (player.currentPosition + deltaMs).coerceAtLeast(0)
-            player.seekTo(if (duration > 0) target.coerceAtMost(duration) else target)
+            val target = (player.currentPosition + deltaMs).coerceAtLeast(minimumValue = 0)
+            player.seekTo(
+                if (duration > 0) {
+                    target.coerceAtMost(maximumValue = duration)
+                } else {
+                    target
+                },
+            )
         }
 
         fun togglePlayPause() {
@@ -121,13 +139,13 @@ internal class PlayerKeyInputState(
             }
 
             Key.MediaFastForward -> {
-                seekBy(seekIncrementMs)
+                seekBy(deltaMs = seekIncrementMs)
                 controls.showControls()
                 true
             }
 
             Key.MediaRewind -> {
-                seekBy(-seekIncrementMs)
+                seekBy(deltaMs = -seekIncrementMs)
                 controls.showControls()
                 true
             }
@@ -152,8 +170,8 @@ internal class PlayerKeyInputState(
 
             Key.DirectionLeft -> {
                 if (!controls.controlsVisible) {
-                    seekBy(-seekIncrementMs)
-                    showSeekFeedback(-seekIncrementMs)
+                    seekBy(deltaMs = -seekIncrementMs)
+                    showSeekFeedback(deltaMs = -seekIncrementMs)
                     true
                 } else {
                     controls.showControls()
@@ -163,8 +181,8 @@ internal class PlayerKeyInputState(
 
             Key.DirectionRight -> {
                 if (!controls.controlsVisible) {
-                    seekBy(seekIncrementMs)
-                    showSeekFeedback(seekIncrementMs)
+                    seekBy(deltaMs = seekIncrementMs)
+                    showSeekFeedback(deltaMs = seekIncrementMs)
                     true
                 } else {
                     controls.showControls()

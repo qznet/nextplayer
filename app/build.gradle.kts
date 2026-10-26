@@ -69,7 +69,9 @@ android {
     splits {
         abi {
             //noinspection WrongGradleMethod
-            val isBuildingBundle = gradle.startParameter.taskNames.any { it.lowercase().contains("bundle") }
+            val isBuildingBundle = gradle.startParameter.taskNames.any {
+                it.lowercase().contains("bundle")
+            }
 
             // 日常测试构建默认只出 armeabi-v7a（电视/盒子上用，编译快、产物少）。
             // 需要全量（正式 release，或明确指定）时传 -PnextplayerAbis=all。
