@@ -208,8 +208,8 @@
     <string name="properties">Properties</string>
     <string name="volume_boost">Volume boost</string>
     <string name="volume_boost_desc">Boost audio volume up to 200%</string>
-    <string name="disable_speed_when_passthrough">Disable speed while passing through</string>
-    <string name="disable_speed_when_passthrough_desc">Off (default): at any speed the compressed stream still goes straight to the receiver (real 5.1 / Atmos) and the audio follows the picture — the pitch changes, but audio and video stay in sync. On: the audio stays at 1x, so the speed does not apply to it (picture fast, sound slow), which is the upstream behaviour. Takes effect the next time the player opens.</string>
+    <string name="decode_to_stereo_when_speeding">Decode to stereo PCM when speeding up</string>
+    <string name="decode_to_stereo_when_speeding_desc">Off (default): straight through all the time, so the receiver keeps the real 5.1 / Atmos; the cost is that a compressed source still plays its audio at 1x while the picture speeds up (audio and video drift apart), which is the upstream behaviour. On: the track is decoded to 2-channel PCM when you change speed, so audio and video stay in sync and the pitch is kept; the receiver then gets PCM and the television decides what to show. Only affects compressed sources (AC3/EAC3/DTS…); AAC/FLAC are time-stretched by the decoder anyway. Takes effect the next time the player opens.</string>
     <string name="open_audio">Open local audio</string>
     <string name="error_opening_audio">Can’t open this audio file</string>
     <string name="open_subtitle">Open local subtitle</string>

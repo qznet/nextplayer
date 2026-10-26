@@ -146,11 +146,11 @@ private fun AudioPreferencesScreenContent(
                     onClick = { onAction(AudioPreferencesUiEvent.ToggleVolumeBoost) },
                 )
                 PreferenceSwitch(
-                    title = stringResource(R.string.disable_speed_when_passthrough),
-                    description = stringResource(R.string.disable_speed_when_passthrough_desc),
+                    title = stringResource(R.string.decode_to_stereo_when_speeding),
+                    description = stringResource(R.string.decode_to_stereo_when_speeding_desc),
                     icon = NextIcons.Speed,
-                    isChecked = state.preferences.disableSpeedWhenPassthrough,
-                    onClick = { onAction(AudioPreferencesUiEvent.ToggleDisableSpeedWhenPassthrough) },
+                    isChecked = state.preferences.decodeToStereoWhenSpeeding,
+                    onClick = { onAction(AudioPreferencesUiEvent.ToggleDecodeToStereoWhenSpeeding) },
                     isLastItem = true,
                 )
             }

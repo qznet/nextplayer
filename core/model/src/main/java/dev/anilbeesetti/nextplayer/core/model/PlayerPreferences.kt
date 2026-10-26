@@ -62,21 +62,23 @@ data class PlayerPreferences(
     val passthroughAtAnySpeed: Boolean = false,
 
     /**
-     * 直通状态下是否**禁止**音频变速。
+     * 调速时是否把音轨降级成 2 声道 PCM。
      *
-     * - false（默认）：倍速时音频仍然是压缩码流直通（功放继续显示 5.1 / Atmos），
-     *   并且音频跟着画面一起变速 —— 音调会变（码流无法保音调地拉伸），
-     *   但音画是同步的。
-     * - true：直通时音频保持 1 倍速，**倍数失效**，画面快声音慢（音画不同步）。
-     *   这是上游原本的默认行为。
+     * 压缩码流（AC3/EAC3/DTS…）自帶时钟，**无法在应用层拉伸**：
+     * 要音画同步就只能解码成 PCM 再由 Sonic 变速，代价是失去码流直通；
+     * 要保住直通就只能让音频恒 1 倍速，音画不同步。两者在这台机器上不可兼得
+     * （media3 在 passthrough 分支根本不会把 speed 下发给 AudioTrack，
+     *  本机 HAL 对压缩流变速也只"受理"不实现）。
      *
-     * 换句话说：调速时不再把音轨降级成 2 声道 PCM（那条路在实测里功放显示始终是
-     * Atmos、听感也仍是环绕声，等于没换），改为一路直通到底。
+     * - false（默认）：**全程直通**。功放一直是真正的 5.1 / Atmos，
+     *   调速时画面快、声音 1 倍速（音画不同步，上游原本的行为）。
+     * - true：调速时降级成 2 声道 PCM，音画同步（音调保持），
+     *   但功放收到的是 PCM，由电视的 Dolby 链决定显示什么。
      *
-     * 只影响压缩音轨（AC3/EAC3/DTS…）；PCM 音源本来就绕开这套逻辑。
+     * 只影响压缩音轨；PCM 音源（AAC/FLAC…）本来就由 Sonic 变速，与本开关无关。
      * 建 player 时读取，改设置后要重开播放器。
      */
-    val disableSpeedWhenPassthrough: Boolean = false,
+    val decodeToStereoWhenSpeeding: Boolean = false,
 
     // Subtitle Preferences
     val useSystemCaptionStyle: Boolean = false,

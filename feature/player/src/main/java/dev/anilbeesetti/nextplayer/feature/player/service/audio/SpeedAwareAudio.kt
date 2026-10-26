@@ -485,13 +485,11 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
      */
     @Volatile
     /**
-     * 直通时是否禁止变速（设置里的「透传时禁用变速」）。
+     * 「调速时降级为 2 声道 PCM」是否打开（只用于日志与诊断）。
      *
-     * false（默认）：直通状态下音频跟着画面变速 —— 码流无法保音调地拉伸，
-     *   所以音调会变，但音画同步。
-     * true：直通时音频保持 1 倍速，倍数失效（上游原本的行为，音画不同步）。
+     * 直通态的变速能力由 [askPlatformSpeed] 决定，与本开关无关。
      */
-    var disableSpeedWhenPassthrough: Boolean = false
+    var decodeToStereoWhenSpeeding: Boolean = false
 
     /** 「这条 mime 在本机能不能解码」，由 service 按当前解码器模式注入，闸门据此决定拦不拦。 */
     @Volatile
@@ -527,16 +525,23 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         enableAudioOutputPlaybackParameters: Boolean,
     ): AudioSink? {
         sinkBuildCount++
-        // 直通分支要不要接受 AudioTrack 变速。
-        // media3 1.11.1 注释原话："we only enable it this was specifically requested by the app"，
-        // 所以这里必须由 app 主动要。给了之后：压缩码流仍原样送给功放（5.1 / Atmos），
-        // 而 AudioTrack 按变速率重采样输出 —— 音调会变，但音画同步。
-        // 关掉它（设置里的「透传时禁用变速」）就退回上游行为：直通时音频恒 1 倍速。
-        val askPlatformSpeed = !disableSpeedWhenPassthrough
+        // 直通分支**不给** AudioTrack 变速的权限（恒 false）。
+        //
+        // media3 1.11.1 的 AudioTrackAudioOutputProvider 里，usePlaybackParameters
+        // 只在 PCM 分支取自 formatConfig.enablePlaybackParameters，**passthrough 分支
+        // 根本不赋值**（恒 false）—— 也就是说即便这里传 true，media3 也不会把 speed
+        // 下发给直通态的 AudioTrack。
+        // 而本机 HAL 对压缩流的变速更是"只受理不实现"：画面变快、声音仍 1 倍速
+        // （音画不同步），历史上开着时还出现过静音。
+        //
+        // 所以压缩音源要音画同步，只能解码成 PCM 由 Sonic 拉伸
+        // （设置里的「调速时降级为 2 声道 PCM」）；要保住码流直通，就只能接受
+        // 音画不同步。这里保持 false，不要改回 true。
+        val askPlatformSpeed = false
         AudioDiag.log(
             "buildAudioSink #$sinkBuildCount (float=$enableFloatOutput " +
                 "upstreamPlaybackParams=$enableAudioOutputPlaybackParameters " +
-                "disableSpeedWhenPassthrough=$disableSpeedWhenPassthrough)",
+                "decodeToStereoWhenSpeeding=$decodeToStereoWhenSpeeding)",
         )
         val builder = DefaultAudioSink.Builder(context)
         // 对齐 just-plus-player（电视上实测能跟着倍速动态切换的那版）的做法：
