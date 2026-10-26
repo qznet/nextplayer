@@ -163,21 +163,13 @@ class PlayerService : MediaSessionService() {
     private var audioTrackDisabledAtMs = 0L
 
     /**
-     * 设置里的「始终解码成 PCM」。
+     * 设置里的「透传时禁用变速」。
      *
      * 建 player 时读取（sink 的输出配置构建时就定死了），改设置要重开播放器才生效。
-     * 打开后：用户一旦调过速就锁定在 2 声道 PCM，回到 1 倍速也不再切回码流。
+     * true：直通时音频保持 1 倍速，倍数失效（上游原本的行为，音画不同步）。
+     * false（默认）：直通时音频跟着画面变速，音调变但音画同步。
      */
-    private var alwaysDecodeToStereo = false
-
-    /**
-     * 「始终解码成 PCM」模式下是否已经锁定在 PCM 态。
-     *
-     * 首次播放**不**锁（闸门预开会让本机 bitstream-only 的 Dolby 硬解走进死路，
-     * 音轨被取消选择 → 整场静音）；用户第一次调速时置位。
-     */
-    private var audioPcmLatched = false
-
+    private var disableSpeedWhenPassthrough = false
     /** 本片源内已经重选过几次。超过 [AUDIO_RESELECT_MAX_PER_ITEM] 就放弃切换，保声音优先。 */
     private var audioReselectCount = 0
 
@@ -254,7 +246,7 @@ class PlayerService : MediaSessionService() {
                 "tracks: audio=${audioTracks.ifEmpty { "none" }} " +
                     "unmapped=${trackSelector.unmappedTrackCount(C.TRACK_TYPE_AUDIO)} " +
                     "gate=${sink?.forceDecode} passthrough=${sink?.isPassthrough} " +
-                    "alwaysDecode=$alwaysDecodeToStereo",
+                    "disableSpeedWhenPassthrough=$disableSpeedWhenPassthrough",
             )
         }
 
@@ -986,22 +978,6 @@ class PlayerService : MediaSessionService() {
      *
      * 另外速度回调本身也可能漏（播放器重建后 speed 回到 1.0 而闸门还停在解码态），
      * 所以还有 [enforceAudioMode] 在关键时机按当前 speed 强制对齐。
-     */
-    /**
-     * 闸门此刻**应该**处于的状态——唯一判据。
-     *
-     * 这里曾经是每个入口各自算一遍：`updateSpeedAudioMode` 认为「始终解码」时闸门恒开，
-     * 而 `enforceAudioMode` 走 `shouldManageAudioPipeline()`（它在始终解码模式下返回 false）
-     * 于是把闸门关回去。两者每隔 2~3 秒互相覆盖一次（实测 22:42:28→22:43:19 日志里
-     * `gate: forceDecode` 来回翻了 8 次），每次翻转都重选音轨、重建音频渲染器——
-     * 听感就是吞字、卡顿，严重时直接没声音。所以只能有一个判据。
-     *
-     * - 「始终解码为 2 声道」：**用户调过速之后**锁定在解码态（[audioPcmLatched]），
-     *   回到 1 倍速也不再切回码流；解不了就别拦（宁可速度不生效也不能静音）。
-     *   注意不能一上来就拦：本机的 Dolby 硬解是 bitstream-only（解码出来的仍是码流），
-     *   闸门预开时 media3 首次选轨就走转码路径 → sink 拒绝非 raw → 音轨被取消选择
-     *   → 整场静音（实测 11:21 那次会话音频渲染器再没 configure 过）。
-     * - 否则：非 1 倍速且这条音轨能解码 → true。
      */
 
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
