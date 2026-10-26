@@ -477,13 +477,6 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
     /** 本机输出路由能承载的 PCM 声道数（启动时探测一次，播放中不会变）。 */
     val routePcmChannels: Int = pcmChannelsOfRoute(context)
 
-    /**
-     * 全程都解码成 PCM（"不让速度打断声音"）。建 player 时从偏好同步过来。
-     *
-     * 置位后 sink 在**第一次 configure 之前**就被设成解码态，因此整场播放不会出现
-     * 直通↔解码的切换，也就没有那 0.2 秒重建空档。代价是 1 倍速也只剩 2 声道。
-     */
-    @Volatile
     /** 「这条 mime 在本机能不能解码」，由 service 按当前解码器模式注入，闸门据此决定拦不拦。 */
     @Volatile
     var decodeCheck: ((String?) -> Boolean)? = null
