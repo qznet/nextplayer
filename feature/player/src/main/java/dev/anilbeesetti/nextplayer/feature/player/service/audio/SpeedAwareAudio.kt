@@ -540,8 +540,14 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
             .build()
         return PassthroughGateAudioSink(speedPcmMode, sink).also { gate ->
             gate.decodeCheck = decodeCheck
-            // 全程 PCM 必须在第一次 configure 之前就位，否则首帧还是会走直通。
-            if (alwaysDecodeToStereo) gate.setForceDecode(true)
+            // 注意：这里**不能**按 alwaysDecodeToStereo 预开闸门。
+            // 本机的 Dolby 硬解是 bitstream-only（解码出来的仍是 Dolby 码流），
+            // 闸门预开时 media3 首次选轨就判定"要转码"，而唯一的解码器给出的还是
+            // 码流 → sink 拒绝非 raw → 音轨被取消选择 → 整场静音
+            // （实测 2026-10-26 11:21 会话：音轨 selected 变 false 后再没回来，
+            //  ARC 线程 800 秒没有任何写入）。
+            // 正确做法：先让 sink 以直通配置起来（这条路径实测稳定），
+            // 用户调速时再切 PCM —— 见 PlayerService.updateSpeedAudioMode。
             gateSink = gate
         }
     }

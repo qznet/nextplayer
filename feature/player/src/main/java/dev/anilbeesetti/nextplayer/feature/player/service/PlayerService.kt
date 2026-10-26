@@ -163,9 +163,17 @@ class PlayerService : MediaSessionService() {
      * 设置里的「始终解码成 PCM」。
      *
      * 建 player 时读取（sink 的输出配置构建时就定死了），改设置要重开播放器才生效。
-     * 打开后闸门常开：1 倍速也走 2 声道 PCM，好处是改速度不重建渲染器、完全不中断。
+     * 打开后：用户一旦调过速就锁定在 2 声道 PCM，回到 1 倍速也不再切回码流。
      */
     private var alwaysDecodeToStereo = false
+
+    /**
+     * 「始终解码成 PCM」模式下是否已经锁定在 PCM 态。
+     *
+     * 首次播放**不**锁（闸门预开会让本机 bitstream-only 的 Dolby 硬解走进死路，
+     * 音轨被取消选择 → 整场静音）；用户第一次调速时置位。
+     */
+    private var audioPcmLatched = false
 
     /** 本片源内已经重选过几次。超过 [AUDIO_RESELECT_MAX_PER_ITEM] 就放弃切换，保声音优先。 */
     private var audioReselectCount = 0
@@ -314,6 +322,7 @@ class PlayerService : MediaSessionService() {
             audioReselectCount = 0
             audioModeRetries = 0
             audioTrackDisabledByUs = false
+            audioPcmLatched = false
             restoreDecoderChoices(mediaItem = mediaItem)
             isMediaItemReady = false
             loadArtworkForCurrentMediaItem()
@@ -945,12 +954,15 @@ class PlayerService : MediaSessionService() {
      * `gate: forceDecode` 来回翻了 8 次），每次翻转都重选音轨、重建音频渲染器——
      * 听感就是吞字、卡顿，严重时直接没声音。所以只能有一个判据。
      *
-     * - 「始终解码为 2 声道」：能解码就恒为 true（1 倍速也不放行码流，来回改速度零重建）；
-     *   解不了就别拦（宁可速度不生效也不能静音）。
+     * - 「始终解码为 2 声道」：**用户调过速之后**锁定在解码态（[audioPcmLatched]），
+     *   回到 1 倍速也不再切回码流；解不了就别拦（宁可速度不生效也不能静音）。
+     *   注意不能一上来就拦：本机的 Dolby 硬解是 bitstream-only（解码出来的仍是码流），
+     *   闸门预开时 media3 首次选轨就走转码路径 → sink 拒绝非 raw → 音轨被取消选择
+     *   → 整场静音（实测 11:21 那次会话音频渲染器再没 configure 过）。
      * - 否则：非 1 倍速且这条音轨能解码 → true。
      */
     private fun desiredGateDecode(): Boolean {
-        if (alwaysDecodeToStereo) return canDecodeSelectedAudio()
+        if (alwaysDecodeToStereo) return audioPcmLatched && canDecodeSelectedAudio()
         val player = mediaSession?.player ?: return false
         val speed = player.playbackParameters.speed
         return abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
@@ -959,10 +971,24 @@ class PlayerService : MediaSessionService() {
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
 
-        // 设置里选了「始终解码成 PCM」：闸门打开就不再关上，速度全程由 Sonic 完成。
-        // 这样跨越 1 倍速不会重建音频渲染器，那 0.2 秒空档也就不存在了。
+        // 设置里选了「始终解码成 PCM」：一旦用户调过速就锁在 PCM 模式，
+        // 回到 1 倍速也不再切回码流（这样 1.0↔1.1 来回按不会反复重建音频渲染器）。
+        // 但**首次播放不预开闸门**：先让 sink 正常以直通配置起来（这条路实测稳定），
+        // 等用户真的调速了再切 PCM。
         if (alwaysDecodeToStereo) {
-            sink.setForceDecode(canDecodeSelectedAudio())
+            if (abs(speed - 1f) > SPEED_UNITY_EPSILON) {
+                audioPcmLatched = true
+            }
+            val wantDecode = desiredGateDecode()
+            if (sink.forceDecode == wantDecode && !force) return
+            val gateChanged = sink.setForceDecode(wantDecode)
+            if (!gateChanged && !force) return
+            AudioDiag.log(
+                "audio mode: ${if (wantDecode) "decoded" else "pass-through"} " +
+                    "(alwaysDecode latched=$audioPcmLatched at $speed)",
+            )
+            audioModeRetries = 0
+            requestAudioReselect("alwaysDecode speed=$speed")
             return
         }
 
@@ -1199,12 +1225,37 @@ class PlayerService : MediaSessionService() {
             ) {
                 restoreAudioTrackType("watchdog")
             }
+            // 卡死自愈：音轨组还在、也还 supported，但一条都没被选中。
+            // 这种情况下音频渲染器不会 configure，整场没声音：ARC 线程 Standby、
+            // Last write 停在几百秒前（实测 2026-10-26 11:21 会话，日志最后一行是
+            // `tracks: audio=audio/eac3 supported=true selected=false`，之后再无 configure）。
+            // 判据用 supported 排除"解码器真的不支持"那种情况——那种重选也救不回来。
+            if (!audioTrackDisabledByUs && !audioRestartInFlight) {
+                recoverStuckAudioTrack()
+            }
             // 重选过程中不要抢跑对齐，否则闸门被来回改
             if (!audioTrackDisabledByUs && !audioRestartInFlight) {
                 enforceAudioMode("watchdog")
             }
             reselectHandler.postDelayed(this, AUDIO_WATCHDOG_INTERVAL_MS)
         }
+    }
+
+    /** 音轨存在却没被选中 → 强制重选一次（限次，避免变成死循环）。 */
+    private fun recoverStuckAudioTrack() {
+        val player = mediaSession?.player ?: return
+        if (player.playbackState != Player.STATE_READY) return
+        if (audioReselectCount >= AUDIO_RESELECT_MAX_PER_ITEM) return
+        val tracks = player.currentTracks ?: return
+        val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        if (audioGroups.isEmpty()) return
+        if (audioGroups.any { it.isSelected }) return
+        val supported = audioGroups.any { group ->
+            (0 until group.length).any { group.isTrackSupported(it) }
+        }
+        if (!supported) return
+        AudioDiag.log("audio stuck: 音轨存在且 supported 但未被选中，强制重选")
+        requestAudioReselect("stuck-audio-track")
     }
 
     /**
