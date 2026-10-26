@@ -484,13 +484,6 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
      * 直通↔解码的切换，也就没有那 0.2 秒重建空档。代价是 1 倍速也只剩 2 声道。
      */
     @Volatile
-    /**
-     * 「调速时降级为 2 声道 PCM」是否打开（只用于日志与诊断）。
-     *
-     * 直通态的变速能力由 [askPlatformSpeed] 决定，与本开关无关。
-     */
-    var decodeToStereoWhenSpeeding: Boolean = false
-
     /** 「这条 mime 在本机能不能解码」，由 service 按当前解码器模式注入，闸门据此决定拦不拦。 */
     @Volatile
     var decodeCheck: ((String?) -> Boolean)? = null
@@ -525,23 +518,25 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         enableAudioOutputPlaybackParameters: Boolean,
     ): AudioSink? {
         sinkBuildCount++
-        // 直通分支**不给** AudioTrack 变速的权限（恒 false）。
+        // 直通分支要接受 AudioTrack 变速（**恢复 2026-10-26 22:02 之前的行为**）。
         //
-        // media3 1.11.1 的 AudioTrackAudioOutputProvider 里，usePlaybackParameters
-        // 只在 PCM 分支取自 formatConfig.enablePlaybackParameters，**passthrough 分支
-        // 根本不赋值**（恒 false）—— 也就是说即便这里传 true，media3 也不会把 speed
-        // 下发给直通态的 AudioTrack。
-        // 而本机 HAL 对压缩流的变速更是"只受理不实现"：画面变快、声音仍 1 倍速
-        // （音画不同步），历史上开着时还出现过静音。
+        // media3 1.11.1 的 AudioTrackAudioOutputProvider，passthrough 分支：
+        //   // Passthrough only supports audio output playback parameters, but we only enable it
+        //   // this was specifically requested by the app.
+        //   usePlaybackParameters = formatConfig.enablePlaybackParameters;
+        // 也就是说**只要 app 主动要**（传 true），直通态的 AudioTrack 就会收到 speed。
         //
-        // 所以压缩音源要音画同步，只能解码成 PCM 由 Sonic 拉伸
-        // （设置里的「调速时降级为 2 声道 PCM」）；要保住码流直通，就只能接受
-        // 音画不同步。这里保持 false，不要改回 true。
-        val askPlatformSpeed = false
+        // 本机实测效果：码流仍按压缩格式交给 HAL，但 HAL 走混音输出，音频按变速率
+        // 播放 —— 音调会变（码流无法保音调地拉伸），但**音画同步**，
+        // 功放那边显示也跟着变成 2 声道/立体声。这正是最初要的效果。
+        //
+        // 代价：HAL 自己的折混不留余量（5.1 满幅求和可达 1.2 倍满刻度），大动态素材
+        // 可能削顶；应用侧的下混（DownmixToStereoAudioProcessor）在直通态不参与。
+        val askPlatformSpeed = true
         AudioDiag.log(
             "buildAudioSink #$sinkBuildCount (float=$enableFloatOutput " +
                 "upstreamPlaybackParams=$enableAudioOutputPlaybackParameters " +
-                "decodeToStereoWhenSpeeding=$decodeToStereoWhenSpeeding)",
+                "passthroughSpeed=always)",
         )
         val builder = DefaultAudioSink.Builder(context)
         // 对齐 just-plus-player（电视上实测能跟着倍速动态切换的那版）的做法：

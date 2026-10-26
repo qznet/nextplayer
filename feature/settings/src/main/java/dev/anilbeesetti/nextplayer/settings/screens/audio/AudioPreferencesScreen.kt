@@ -144,13 +144,6 @@ private fun AudioPreferencesScreenContent(
                     icon = NextIcons.VolumeUp,
                     isChecked = state.preferences.enableVolumeBoost,
                     onClick = { onAction(AudioPreferencesUiEvent.ToggleVolumeBoost) },
-                )
-                PreferenceSwitch(
-                    title = stringResource(R.string.decode_to_stereo_when_speeding),
-                    description = stringResource(R.string.decode_to_stereo_when_speeding_desc),
-                    icon = NextIcons.Speed,
-                    isChecked = state.preferences.decodeToStereoWhenSpeeding,
-                    onClick = { onAction(AudioPreferencesUiEvent.ToggleDecodeToStereoWhenSpeeding) },
                     isLastItem = true,
                 )
             }

@@ -162,15 +162,6 @@ class PlayerService : MediaSessionService() {
     private var audioTrackDisabledByUs = false
     private var audioTrackDisabledAtMs = 0L
 
-    /**
-     * 设置里的「调速时降级为 2 声道 PCM」。
-     *
-     * 建 player 时读取（sink 的输出配置构建时就定死了），改设置要重开播放器才生效。
-     * true：调速时把音轨降级成 2 声道 PCM，音画同步（Sonic 变速，音调保持）。
-     * false（默认）：全程直通，功放一直是真正的 5.1 / Atmos，
-     * 代价是调速时音频恒 1 倍速（音画不同步，上游原本的行为）。
-     */
-    private var decodeToStereoWhenSpeeding = false
     /** 本片源内已经重选过几次。超过 [AUDIO_RESELECT_MAX_PER_ITEM] 就放弃切换，保声音优先。 */
     private var audioReselectCount = 0
 
@@ -247,7 +238,7 @@ class PlayerService : MediaSessionService() {
                 "tracks: audio=${audioTracks.ifEmpty { "none" }} " +
                     "unmapped=${trackSelector.unmappedTrackCount(C.TRACK_TYPE_AUDIO)} " +
                     "gate=${sink?.forceDecode} passthrough=${sink?.isPassthrough} " +
-                    "decodeToStereoWhenSpeeding=$decodeToStereoWhenSpeeding",
+                    "passthrough=always",
             )
         }
 
@@ -988,12 +979,7 @@ class PlayerService : MediaSessionService() {
      *   （解不了就别拦，宁可速度不生效也不能静音）。
      * - 关闭（默认）：恒为 false —— 全程直通，调速不动音频通路。
      */
-    private fun desiredGateDecode(): Boolean {
-        if (!decodeToStereoWhenSpeeding) return false
-        val player = mediaSession?.player ?: return false
-        val speed = player.playbackParameters.speed
-        return abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
-    }
+    private fun desiredGateDecode(): Boolean = false
 
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
@@ -1278,15 +1264,11 @@ class PlayerService : MediaSessionService() {
             setDecoderManager(decoderManager = decoderManager)
             // sink 的输出配置在建 player 时定死，所以这里是唯一能设进去的时机。
             // 改设置后重开播放器生效（设置页里已写明）。
-            decodeToStereoWhenSpeeding = playerPreferences.decodeToStereoWhenSpeeding
             // 闸门只拦「真能解码」的格式：本机 ARC 不认 DTS/TrueHD，平台也没有对应解码器，
             // 拦掉它们等于把这条音轨变成静音（开关启用后有的视频没声音就是这么来的）。
             decodeCheck = { mime -> mime == null || canDecodeAudioMime(mime, decoderManager.audioMode) }
-            AudioDiag.log(
-                "speed audio mode: decodeToStereoWhenSpeeding=$decodeToStereoWhenSpeeding",
-            )
+            AudioDiag.log("speed audio mode: passthrough with platform speed")
         }
-        this@PlayerService.decodeToStereoWhenSpeeding = playerPreferences.decodeToStereoWhenSpeeding
         speedAudioFactory = renderersFactory
 
         trackSelector = DefaultTrackSelector(applicationContext).apply {
