@@ -981,6 +981,16 @@ class PlayerService : MediaSessionService() {
             }
             val wantDecode = desiredGateDecode()
             if (sink.forceDecode == wantDecode && !force) return
+            // 解码器同样跟着走：PCM 需要 FFmpeg 软解（Dolby 硬解是 bitstream-only），
+            // 码流需要系统解码器（AUTO，扩展渲染器 PREFERRED 不会抢轨道）。
+            val wantedDecoderMode = if (wantDecode) DecoderMode.FFMPEG else DecoderMode.AUTO
+            if (decoderManager.audioMode != wantedDecoderMode) {
+                AudioDiag.log(
+                    "audio decoder: ${decoderManager.audioMode} -> $wantedDecoderMode " +
+                        "(alwaysDecode latched=$audioPcmLatched)",
+                )
+                selectDecoder(DecoderTrackType.AUDIO, wantedDecoderMode, persist = false)
+            }
             val gateChanged = sink.setForceDecode(wantDecode)
             if (!gateChanged && !force) return
             AudioDiag.log(
@@ -1014,6 +1024,22 @@ class PlayerService : MediaSessionService() {
             return
         }
         reselectHandler.removeCallbacks(bitstreamRestoreRunnable)
+
+        // 音频解码器要跟着模式走，否则两端都会断：
+        // - 切到 PCM 时必须用 FFmpeg 软解。本机的 Dolby 硬解是 bitstream-only
+        //   （解出来的仍是 Dolby 码流），sink 拒绝非 raw → 音轨被取消选择 → 整场静音。
+        //   让 DecoderMediaCodecSelector 在 FFMPEG 模式返回空，扩展渲染器接管，解出真 PCM。
+        // - 切回码流时回到 AUTO：系统解码器 + passthrough 才能成立
+        //   （此时扩展渲染器是 PREFERRED，不会再抢轨道）。
+        // persist=false：不写回片源，用户的解码器选择不被这次临时切换污染。
+        val wantedDecoderMode = if (wantDecode) DecoderMode.FFMPEG else DecoderMode.AUTO
+        if (decoderManager.audioMode != wantedDecoderMode) {
+            AudioDiag.log(
+                "audio decoder: ${decoderManager.audioMode} -> $wantedDecoderMode " +
+                    "(because audio mode = ${audioModeName(!wantDecode)})",
+            )
+            selectDecoder(DecoderTrackType.AUDIO, wantedDecoderMode, persist = false)
+        }
 
         val gateChanged = sink.setForceDecode(wantDecode)
         if (!gateChanged && !force) return

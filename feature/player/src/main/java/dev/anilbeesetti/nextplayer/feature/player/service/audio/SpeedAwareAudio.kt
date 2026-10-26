@@ -502,7 +502,18 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         // FFmpeg 扩展渲染器默认不加载（extensionRendererMode 默认 OFF），
         // 选「软解+」时 DecoderMediaCodecSelector 返回空列表、FfmpegVideoRenderer 又不在
         // 渲染器列表里，必然报「没有支持此媒体的解码器可用」。这里打开它，让软解真能用。
-        setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+        //
+        // 用 **PREFERRED** 而不是 ON：nextlib 把 FfmpegAudioRenderer 插在渲染器列表最前面，
+        // ON 模式下它会抢在系统解码器之前拿到 EAC3 轨道 → 软解出 PCM 交给 sink
+        // → **压缩码流根本没机会以 IEC61937 送出去**，passthrough 形同虚设。
+        // 实测（2026-10-26 11:46，1.0 倍速应用侧确认 passthrough=true）：
+        //   flinger 里我们的 AudioStreamOut 只有 flags 0x2 (PRIMARY)，MIXER 线程
+        //   HAL format = PCM_16_BIT / 2ch；而 just-plus-player 是
+        //   flags 0x11 (DIRECT|COMPRESS_OFFLOAD)，独立 OFFLOAD 线程走 E_AC3 6ch。
+        //   功放因此永远只能看到电视重编码出来的杜比，显示无法跟随。
+        // PREFERRED 保留扩展渲染器兜底（选 FFMPEG 软解时它仍要上场），
+        // 但让系统解码器优先，passthrough 才有机会成立。
+        setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFERRED)
         // 注意：Dolby Vision **必须**交给系统 DV 解码器（OMX.MS.DOLBY_VISION.Decoder）。
         // 曾试过把 video/dolby-vision 改投 HEVC 解码器，结果画面严重偏绿/发灰 ——
         // DV Profile 5 的码流是 IPTPQc2 色彩编码，只有 DV 解码器会做颜色转换，
