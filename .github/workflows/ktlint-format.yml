@@ -1,0 +1,50 @@
+name: ktlint format (one-off)
+
+# 上游 c129d67c / eeca7149 引入了强制"多参数调用必须竖排"的 ktlint 规则，
+# 本 fork 自己的 Kotlin 文件（PlayerService / SpeedAwareAudio / build.gradle.kts 等）
+# 不满足新规则，android_build 的 Lint Checks 会红。
+# 这个 workflow 只做一件事：跑 ktlintFormat 并把格式化结果提交回 main，跑完即可删除。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Apply ktlintFormat
+        # --continue：让所有模块都跑一遍，别在第一个模块就中止
+        run: ./gradlew ktlintFormat --continue || true
+
+      - name: Commit and push formatting
+        run: |
+          git config user.name "qznet"
+          git config user.email "qznet@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有需要格式化的改动"
+            exit 0
+          fi
+          git commit -m "style: 按上游新 ktlint 规则格式化本 fork 的 Kotlin 文件（仅排版，无功能改动）"
+          git push origin HEAD:main
+
+      - name: Report remaining violations
+        # 自动修正不了的部分（例如无法换行的超长行）打在这里，人工收尾
+        run: ./gradlew ktlintCheck --continue || true

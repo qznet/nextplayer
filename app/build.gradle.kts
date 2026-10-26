@@ -92,9 +92,16 @@ android {
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .map { abiAliases[it.lowercase()] ?: it }
-            val buildAll = requested.isEmpty() || requested.any { it.equals("all", true) } || requested.size > 1
+            val buildAll = requested.isEmpty() ||
+                requested.any { it.lowercase() == "all" } ||
+                requested.size > 1
             val selected = if (buildAll) {
-                listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+                listOf(
+                    "armeabi-v7a",
+                    "arm64-v8a",
+                    "x86",
+                    "x86_64",
+                )
             } else {
                 requested
             }
