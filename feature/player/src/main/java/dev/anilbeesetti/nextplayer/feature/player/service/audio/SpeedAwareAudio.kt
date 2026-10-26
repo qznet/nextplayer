@@ -362,12 +362,16 @@ internal class DownmixToStereoAudioProcessor(
         const val SURROUND_GAIN = 0.7071f
 
         /**
-         * LFE 折叠增益 -9dB。
+         * LFE 折叠增益：**0 = 直接丢弃**。
          *
-         * Dolby 规范里 2.0 折叠默认丢弃 LFE；但实测丢弃后整体听感明显发薄，
-         * 所以保留一点点低频能量。取值足够低，配合 [HEADROOM] 与 [bend] 不会过载。
+         * 原来这里保留 -9dB（0.354）的低频能量，理由是"丢弃后听感发薄"。
+         * 但 2026-10-26 的同机对照给出了更重要的理由：电视的 Dolby 链
+         * （`Dolby bypass: 0`）会按**内容**判断要不要升混成 5.1 杜比，
+         * 带低频能量的双声道被判成环绕内容 → 功放一直显示 Atmos/透传。
+         * 参考实现 just-plus-player 的矩阵里 LFE 是 `{0, 0}`（完全丢弃），
+         * 它在同机同片源上能让功放显示立体声。现在与它完全对齐。
          */
-        const val LFE_GAIN = 0.354f
+        const val LFE_GAIN = 0f
 
         /** 输出余量 -6dB，给软限幅器留头。 */
         const val HEADROOM = 0.5f
@@ -407,7 +411,7 @@ internal class DownmixToStereoAudioProcessor(
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(LFE_GAIN, LFE_GAIN),
+                floatArrayOf(0f, 0f),
                 floatArrayOf(SURROUND_GAIN, 0f),
                 floatArrayOf(0f, SURROUND_GAIN),
             )
@@ -415,7 +419,7 @@ internal class DownmixToStereoAudioProcessor(
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(LFE_GAIN, LFE_GAIN),
+                floatArrayOf(0f, 0f),
                 floatArrayOf(BACK_GAIN, BACK_GAIN),
                 floatArrayOf(SURROUND_GAIN, 0f),
                 floatArrayOf(0f, SURROUND_GAIN),
@@ -424,7 +428,7 @@ internal class DownmixToStereoAudioProcessor(
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(LFE_GAIN, LFE_GAIN),
+                floatArrayOf(0f, 0f),
                 floatArrayOf(BACK_GAIN, 0f),
                 floatArrayOf(0f, BACK_GAIN),
                 floatArrayOf(SURROUND_GAIN, 0f),
