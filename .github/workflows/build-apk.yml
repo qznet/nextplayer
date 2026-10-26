@@ -88,8 +88,22 @@ jobs:
           git tag -d latest || true
           NOTES=$(cat <<'EOF'
           自动同步上游 AnilBeesetti/nextplayer 最新代码，叠加本 fork 的改造：
-          1. 全屏播放 DPAD_UP/DOWN 按 0.1 步进调倍速（0.2~4.0）+ Toast 提示
-          2. 非 1 倍速时关闭音频透传，解码为 PCM 并下混 2 声道；回到 1 倍速自动恢复透传
+
+          **1. 遥控器调速**
+          全屏播放 DPAD_UP/DOWN 按 0.1 步进调倍速（0.2~4.0），带 Toast 提示。
+
+          **2. 音频管线按速度自动切换（无任何设置开关）**
+          - 1.0 倍速：压缩音轨（AC3 / E-AC3）**原样直通**给功放，5.1 / Atmos 由功放解码，
+            HAL 侧是 `OFFLOAD + E_AC3 + 6ch`。
+          - 非 1.0 倍速：关闭直通 → 解码成 PCM，下混为 2 声道交给 Sonic 变速，
+            音画同步；折叠矩阵保留中置 / 环绕，LFE 按 -9dB 保留（不发薄）。
+          - 回到 1.0 倍速稳住 3 秒后自动恢复码流直通，期间来回连按不会反复切换。
+          - 重选额度是 2 秒 / 4 次的滑动窗口，**不会用完就永久失效**。
+
+          **3. 稳定性**
+          - 直通闸门只拦「本机真能解码」的格式（DTS / TrueHD 继续给 ARC，不制造静音）。
+          - 音轨被临时禁用后有超时恢复 + 校验 + 看门狗三道保险，卡死能自愈。
+          - Dolby Vision 保持交给系统 DV 解码器；FFmpeg 扩展渲染器保持「核心优先」。
 
           包名 dev.anilbeesetti.nextplayer.release（debug key 签名）。
           ABI 策略：日常/测试构建默认只出 armeabi-v7a；只有正式版发布或明确指定时才出全量（arm64-v8a / x86 / universal）。
@@ -98,6 +112,6 @@ jobs:
           )
           gh release create latest \
             --target main \
-            --title "NextPlayer TV 版（上下键倍速 + 非1倍速转2声道PCM · latest）" \
+            --title "NextPlayer TV 版 v0.19.1（上下键倍速 + 按速度切换音频管线）" \
             --notes "$NOTES" \
             app/build/outputs/apk/release-with-debug-signing/*.apk
