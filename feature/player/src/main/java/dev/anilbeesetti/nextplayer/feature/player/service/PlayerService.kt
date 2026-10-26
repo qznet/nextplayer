@@ -162,8 +162,34 @@ class PlayerService : MediaSessionService() {
     private var audioTrackDisabledByUs = false
     private var audioTrackDisabledAtMs = 0L
 
-    /** 本片源内已经重选过几次。超过 [AUDIO_RESELECT_MAX_PER_ITEM] 就放弃切换，保声音优先。 */
+    /** 本片源内累计重选次数，**只用于诊断日志**，不再作为闸门（见 [audioReselectTimes]）。 */
     private var audioReselectCount = 0
+
+    /**
+     * 最近若干次重选的时间戳，用于**滑动窗口**限速。
+     *
+     * 这里原先是一个"本片源内最多重选 6 次"的硬上限，实机踩坑（2026-10-26 18:07）：
+     * 一次速度往返要重选两次（切 PCM 一次、回 1 倍切回码流一次），用户按三轮就把额度耗尽，
+     * 之后日志固定打印 `audio reselect: giving up after 6 tries`，表现就是
+     * **1 倍速停一会儿之后就再也调不动速度** —— 闸门要求解码，渲染器却没重选，
+     * 码流继续直通，速度对音频不生效；音频又是主时钟，于是画面也不变速。
+     * 改成窗口限速：短时间内的连按被合并，但额度**不会永久耗尽**。
+     */
+    private val audioReselectTimes = java.util.ArrayDeque<Long>()
+
+    /**
+     * 已经连续失败、暂时不要再折腾的目标状态（true = 要解码 / false = 要直通）。
+     *
+     * 只靠窗口限速不够：万一某个状态下管线真的切不过去（解码器被占满等），
+     * 看门狗每 [AUDIO_WATCHDOG_INTERVAL_MS] 纠正一次、每次都触发重选，就会无限重建
+     * 音频渲染器、反复抢 mediacodec。校验确认切不过去之后记下目标状态，同一个目标不再重试；
+     * 速度再次跨过 1 倍速（目标状态翻转）、换片源或切成功时自动解除。
+     */
+    private var audioModeStalledFor: Boolean? = null
+
+    /** 音轨卡死自愈的上次尝试时间与累计次数（与速度切换的额度分开，互不挤占）。 */
+    private var stuckRecoveryAtMs = 0L
+    private var stuckRecoveryCount = 0
 
     /** [enforceAudioMode] 上次纠正的时间，防止看门狗与事件回调互相触发形成抖动。 */
     private var audioEnforceAtMs = 0L
@@ -307,6 +333,9 @@ class PlayerService : MediaSessionService() {
             speedAudioFactory?.gateSink?.clearDenylist()
             decodeBlockedForItem = false
             audioReselectCount = 0
+            audioReselectTimes.clear()
+            audioModeStalledFor = null
+            stuckRecoveryCount = 0
             audioModeRetries = 0
             audioTrackDisabledByUs = false
             restoreDecoderChoices(mediaItem = mediaItem)
@@ -378,6 +407,11 @@ class PlayerService : MediaSessionService() {
 
         override fun onTracksChanged(tracks: Tracks) {
             super.onTracksChanged(tracks)
+            // 音轨真的被选中了 → 卡死自愈的额度回满。卡死时不会有这个事件，
+            // 所以额度只会在一路卡死的情况下被耗尽。
+            if (tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }) {
+                stuckRecoveryCount = 0
+            }
             // 我们自己禁用音轨引发的轨道变化：立刻恢复（幂等）并只安排事后校验。
             // 这次变化不代表用户换了片源，也不能拿它去判断"解码器不支持"——
             // 音轨刚被我们禁用时是 unselected 的，判成不支持会误报解码失败。
@@ -1018,8 +1052,13 @@ class PlayerService : MediaSessionService() {
         if (!gateChanged && !force) return
 
         val wantPassthrough = !wantDecode
-        if (!gateChanged && sink.isPassthrough == wantPassthrough) {
+        // 管线实际状态已经是想要的那一种 → 不重选。
+        // 这里**不能只看 gateChanged**：闸门变了、但渲染器本来就按期望工作的情况很常见
+        // （例如 1.0 稳住后切回码流时，实测 actual 已经是 pass-through）。
+        // 白重选一次 = 白断一次声音 + 功放白闪一下立体声。
+        if (sink.isPassthrough == wantPassthrough) {
             audioModeRetries = 0
+            audioModeStalledFor = null
             return
         }
         AudioDiag.log(
@@ -1098,8 +1137,18 @@ class PlayerService : MediaSessionService() {
     private val audioReselectRunnable = Runnable {
         val sink = speedAudioFactory?.gateSink ?: return@Runnable
         val player = mediaSession?.player ?: return@Runnable
-        val wantDecode = abs(player.playbackParameters.speed - 1f) > SPEED_UNITY_EPSILON
-        if (sink.forceDecode == wantDecode && sink.isPassthrough != wantDecode) {
+        // 意图必须用 desiredGateDecode()：只看 speed 会把"本机解不出来、闸门保持直通"
+        // 的片源判成"该解码"，然后无限重选。
+        val wantDecode = desiredGateDecode()
+        if (sink.forceDecode != wantDecode) {
+            AudioDiag.log(
+                "reselect re-aimed: gate=${sink.forceDecode} want=$wantDecode " +
+                    "(speed=${player.playbackParameters.speed})",
+            )
+            updateSpeedAudioMode(player.playbackParameters.speed, force = true)
+            return@Runnable
+        }
+        if (sink.isPassthrough != wantDecode) {
             AudioDiag.log("reselect dropped: already satisfied (gate=$wantDecode)")
             return@Runnable
         }
@@ -1111,18 +1160,41 @@ class PlayerService : MediaSessionService() {
         val player = mediaSession?.player as? ExoPlayer ?: return
         // 已经在重选中：再发一次只会让渲染器白重建一轮
         if (audioTrackDisabledByUs) return
-        if (audioReselectCount >= AUDIO_RESELECT_MAX_PER_ITEM) {
-            AudioDiag.log("audio reselect: giving up after $audioReselectCount tries ($reason)")
+        val sink = speedAudioFactory?.gateSink ?: return
+        // 这个目标状态已经确认切不过去：不再重试，免得无限重建渲染器
+        if (audioModeStalledFor != null && audioModeStalledFor == sink.forceDecode) {
+            AudioDiag.log("audio reselect: stalled for gate=${sink.forceDecode}, skip ($reason)")
             return
         }
-        audioReselectCount++
         val now = SystemClock.uptimeMillis()
+        while (audioReselectTimes.isNotEmpty() &&
+            now - audioReselectTimes.peekFirst() > AUDIO_RESELECT_WINDOW_MS
+        ) {
+            audioReselectTimes.pollFirst()
+        }
+        if (audioReselectTimes.size >= AUDIO_RESELECT_MAX_PER_WINDOW) {
+            val inWindow = now - audioReselectTimes.peekFirst()
+            val wait = (AUDIO_RESELECT_WINDOW_MS - inWindow).coerceAtLeast(0) + AUDIO_RESELECT_RETRY_MS
+            AudioDiag.log(
+                "audio reselect: rate limited (${audioReselectTimes.size} in ${inWindow}ms), " +
+                    "retry in ${wait}ms ($reason)",
+            )
+            // 延后**重新评估**，不是记仇：期间用户把速度切回去就自动作罢
+            reselectHandler.removeCallbacks(audioReselectRunnable)
+            reselectHandler.postDelayed(audioReselectRunnable, wait)
+            return
+        }
+        audioReselectTimes.addLast(now)
+        audioReselectCount++
         audioRestartInFlight = true
         audioReselectScheduledAtMs = now
         audioReselectAtMs = now
         audioTrackDisabledAtMs = now
         audioTrackDisabledByUs = true
-        AudioDiag.log("audio reselect #$audioReselectCount: disable audio track ($reason)")
+        AudioDiag.log(
+            "audio reselect #$audioReselectCount: disable audio track ($reason) " +
+                "(window=${audioReselectTimes.size}/$AUDIO_RESELECT_MAX_PER_WINDOW)",
+        )
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
             .build()
@@ -1183,6 +1255,7 @@ class PlayerService : MediaSessionService() {
         val wantPassthrough = abs(speed - 1f) <= SPEED_UNITY_EPSILON
         if (sink.isPassthrough == wantPassthrough) {
             audioModeRetries = 0
+            audioModeStalledFor = null
             // sink speed 是音频管线**自己**认的速率：解码态由 Sonic 落地，直通态恒为 1.0。
             // 它和 player speed 不一致，就说明声音没跟上画面（音画会持续漂移）。
             AudioDiag.log(
@@ -1192,9 +1265,13 @@ class PlayerService : MediaSessionService() {
             return@Runnable
         }
         if (audioModeRetries >= AUDIO_MODE_MAX_RETRIES) {
+            // 记下这个目标状态不再折腾：否则看门狗每次纠正都会再触发一轮重选，
+            // 无限重建音频渲染器（本机实测会把视频解码器也挤掉）。
+            // 速度再次跨过 1 倍速、换片源或切成功时解除。
+            audioModeStalledFor = sink.forceDecode
             AudioDiag.log(
                 "audio mode: still ${audioModeName(sink.isPassthrough)} at $speed after " +
-                    "$audioModeRetries retries, leaving it",
+                    "$audioModeRetries retries, stall gate=${sink.forceDecode} until speed crosses 1x",
             )
             return@Runnable
         }
@@ -1234,11 +1311,15 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    /** 音轨存在却没被选中 → 强制重选一次（限次，避免变成死循环）。 */
+    /** 音轨存在却没被选中 → 强制重选一次（限次限频，避免变成死循环）。 */
     private fun recoverStuckAudioTrack() {
         val player = mediaSession?.player ?: return
         if (player.playbackState != Player.STATE_READY) return
-        if (audioReselectCount >= AUDIO_RESELECT_MAX_PER_ITEM) return
+        // 自愈有**独立**的额度：以前它和"调速切换"共用同一个计数器，
+        // 卡死自愈几次就会把调速的额度吃光（→ 之后速度调不动）。
+        if (stuckRecoveryCount >= AUDIO_STUCK_RECOVERY_MAX_PER_ITEM) return
+        val now = SystemClock.uptimeMillis()
+        if (now - stuckRecoveryAtMs < AUDIO_STUCK_RECOVERY_INTERVAL_MS) return
         val tracks = player.currentTracks ?: return
         val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
         if (audioGroups.isEmpty()) return
@@ -1247,7 +1328,12 @@ class PlayerService : MediaSessionService() {
             (0 until group.length).any { group.isTrackSupported(it) }
         }
         if (!supported) return
-        AudioDiag.log("audio stuck: 音轨存在且 supported 但未被选中，强制重选")
+        stuckRecoveryAtMs = now
+        stuckRecoveryCount++
+        AudioDiag.log(
+            "audio stuck: 音轨存在且 supported 但未被选中，强制重选 " +
+                "(#$stuckRecoveryCount/$AUDIO_STUCK_RECOVERY_MAX_PER_ITEM)",
+        )
         requestAudioReselect("stuck-audio-track")
     }
 
@@ -1858,13 +1944,21 @@ private const val AUDIO_WATCHDOG_INTERVAL_MS = 3000L
 private const val AUDIO_WATCHDOG_GRACE_MS = 2500L
 
 /**
- * 同一片源内最多重选几次。
+ * 重选限速的**滑动窗口**长度与窗口内允许的次数。
  *
- * 每次重选都要销毁再重建 audio renderer（连带 mediacodec 抢占）。本机实测
- * 两次以上就足以把 4K 视频解码器挤到初始化失败，弹出「没有支持此媒体的解码器」。
- * 超过上限就放弃速度切换：宁可速度不生效，也要保证画面和声音都在。
+ * 早先用的是"本片源内最多重选 6 次"的硬上限，实机致命：一次速度往返就要重选两次
+ * （切 PCM 一次、回 1 倍切回码流一次），按三轮就永久失效 —— 之后速度只能改数字，
+ * 实际播放一直是 1 倍速。窗口限速只压制"连按期间的抖动"，额度会自动恢复。
+ *
+ * 取 2 秒 / 4 次：正常一次往返（两次重选，间隔 >250ms）完全够用，
+ * 而用户狂按上下键时最多 2 秒内重选 4 次，超出的请求延后重新评估（多数会被合并掉）。
  */
-private const val AUDIO_RESELECT_MAX_PER_ITEM = 6
+private const val AUDIO_RESELECT_WINDOW_MS = 2000L
+private const val AUDIO_RESELECT_MAX_PER_WINDOW = 4
+
+/** 卡死自愈的独立额度与最小间隔（与调速切换的额度分开，互不挤占）。 */
+private const val AUDIO_STUCK_RECOVERY_MAX_PER_ITEM = 10
+private const val AUDIO_STUCK_RECOVERY_INTERVAL_MS = 3000L
 
 /** [enforceAudioMode] 两次纠正之间的最小间隔，防止与看门狗互相触发形成抖动。 */
 private const val AUDIO_ENFORCE_MIN_INTERVAL_MS = 1500L
