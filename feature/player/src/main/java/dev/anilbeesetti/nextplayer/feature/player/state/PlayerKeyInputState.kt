@@ -221,11 +221,17 @@ internal class PlayerKeyInputState(
      */
     private fun changeSpeedBy(delta: Float) {
         val current = (player.playbackParameters.speed * 10f).roundToInt() / 10f
-        val target = (((current + delta) * 10f).roundToInt() / 10f).coerceIn(MIN_SPEED, MAX_SPEED)
+        val target = (((current + delta) * 10f).roundToInt() / 10f).coerceIn(
+            MIN_SPEED,
+            MAX_SPEED,
+        )
         if (target != current) player.setPlaybackSpeed(target)
         Toast.makeText(
             context,
-            context.getString(coreUiR.string.fast_playback_speed, target),
+            context.getString(
+                coreUiR.string.fast_playback_speed,
+                target,
+            ),
             Toast.LENGTH_SHORT,
         ).show()
     }

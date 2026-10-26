@@ -128,11 +128,9 @@ private class TrackRecovery {
  * 对同一个硬解器再打一枪），每个片源最多两次尝试。宁可让用户手动换解码器，
  * 也不能把系统解码器打废。
  */
-private fun DecoderMode.fallbackModes(): List<DecoderMode> {
-    return when (this) {
-        DecoderMode.AUTO -> listOf(DecoderMode.SOFTWARE)
-        DecoderMode.HARDWARE -> listOf(DecoderMode.SOFTWARE)
-        DecoderMode.SOFTWARE -> listOf(DecoderMode.FFMPEG)
-        DecoderMode.FFMPEG -> emptyList()
-    }
+private fun DecoderMode.fallbackModes(): List<DecoderMode> = when (this) {
+    DecoderMode.AUTO -> listOf(DecoderMode.SOFTWARE)
+    DecoderMode.HARDWARE -> listOf(DecoderMode.SOFTWARE)
+    DecoderMode.SOFTWARE -> listOf(DecoderMode.FFMPEG)
+    DecoderMode.FFMPEG -> emptyList()
 }

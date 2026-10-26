@@ -14,11 +14,11 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.audio.AudioCapabilities
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.ForwardingAudioSink
-import androidx.media3.exoplayer.DefaultRenderersFactory
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.DecoderMode
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import java.io.File
@@ -47,7 +47,10 @@ internal object AudioDiag {
     @Volatile
     private var file: File? = null
 
-    private val timeFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    private val timeFormat = SimpleDateFormat(
+        "MM-dd HH:mm:ss.SSS",
+        Locale.US,
+    )
     private val lock = Any()
 
     fun init(context: Context) {
@@ -55,14 +58,20 @@ internal object AudioDiag {
         val dir = runCatching { context.getExternalFilesDir("diag") }.getOrNull() ?: return
         runCatching {
             if (!dir.exists()) dir.mkdirs()
-            val target = File(dir, FILE_NAME)
+            val target = File(
+                dir,
+                FILE_NAME,
+            )
             if (target.exists() && target.length() > MAX_BYTES) target.delete()
             file = target
         }
     }
 
     fun log(message: String) {
-        Log.i(TAG, message)
+        Log.i(
+            TAG,
+            message,
+        )
         val target = file ?: return
         val line = "${timeFormat.format(Date())} $message\n"
         synchronized(lock) {
@@ -113,10 +122,8 @@ class AudioSpeedPcmMode {
  * 只有这种情况才算。状态机（PlayerService）用它判断切换有没有真的生效。
  */
 @UnstableApi
-class PassthroughGateAudioSink(
-    private val mode: AudioSpeedPcmMode,
-    delegate: AudioSink,
-) : ForwardingAudioSink(delegate) {
+class PassthroughGateAudioSink(private val mode: AudioSpeedPcmMode, delegate: AudioSink) :
+    ForwardingAudioSink(delegate) {
 
     private val deniedMimes = CopyOnWriteArraySet<String>()
 
@@ -254,15 +261,16 @@ class PassthroughGateAudioSink(
  *    这样偶发过载只是被轻微压缩，而不是硬削。
  */
 @UnstableApi
-internal class DownmixToStereoAudioProcessor(
-    private val routePcmChannels: Int,
-) : BaseAudioProcessor() {
+internal class DownmixToStereoAudioProcessor(private val routePcmChannels: Int) :
+    BaseAudioProcessor() {
 
     private var gains: Array<FloatArray>? = null
     private var inputChannels: Int = 0
     private var limited: Boolean = false
 
-    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+    override fun onConfigure(
+        inputAudioFormat: AudioProcessor.AudioFormat,
+    ): AudioProcessor.AudioFormat {
         gains = null
         inputChannels = 0
         limited = false
@@ -275,19 +283,31 @@ internal class DownmixToStereoAudioProcessor(
         if (channels <= STEREO_CHANNEL_COUNT) return AudioProcessor.AudioFormat.NOT_SET
         // 路由自己就能承载这么多声道，不必折叠
         if (routePcmChannels in (STEREO_CHANNEL_COUNT + 1)..channels) {
-            AudioDiag.log("downmix skipped: route accepts $routePcmChannels ch (input $channels ch)")
+            AudioDiag.log(
+                "downmix skipped: route accepts $routePcmChannels ch (input $channels ch)",
+            )
             return AudioProcessor.AudioFormat.NOT_SET
         }
 
         val matrix = layoutFor(channels)
-            ?: if (channels > MAX_KNOWN_LAYOUT) widen(channels) else return AudioProcessor.AudioFormat.NOT_SET
+            ?: if (channels >
+                MAX_KNOWN_LAYOUT
+            ) {
+                widen(channels)
+            } else {
+                return AudioProcessor.AudioFormat.NOT_SET
+            }
         gains = matrix
         inputChannels = channels
         AudioDiag.log(
             "downmix: folding $channels ch -> 2 ch at ${inputAudioFormat.sampleRate}Hz " +
                 "(encoding=$encoding, route pcm channels=$routePcmChannels)",
         )
-        return AudioProcessor.AudioFormat(inputAudioFormat.sampleRate, STEREO_CHANNEL_COUNT, encoding)
+        return AudioProcessor.AudioFormat(
+            inputAudioFormat.sampleRate,
+            STEREO_CHANNEL_COUNT,
+            encoding,
+        )
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -338,7 +358,9 @@ internal class DownmixToStereoAudioProcessor(
         if (magnitude <= KNEE) return value
         if (!limited) {
             limited = true
-            AudioDiag.log("downmix: the fold reached the limiter, this mix is mastered at full scale")
+            AudioDiag.log(
+                "downmix: the fold reached the limiter, this mix is mastered at full scale",
+            )
         }
         val excess = magnitude - KNEE
         val shaped = KNEE + (excess * SLOPE) / (excess + SLOPE)
@@ -386,50 +408,155 @@ internal class DownmixToStereoAudioProcessor(
          */
         fun layoutFor(channels: Int): Array<FloatArray>? = when (channels) {
             3 -> arrayOf( // FL FR FC
-                floatArrayOf(1f, 0f),
-                floatArrayOf(0f, 1f),
-                floatArrayOf(CENTER_GAIN, CENTER_GAIN),
+                floatArrayOf(
+                    1f,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    1f,
+                ),
+                floatArrayOf(
+                    CENTER_GAIN,
+                    CENTER_GAIN,
+                ),
             )
+
             4 -> arrayOf( // FL FR BL BR
-                floatArrayOf(1f, 0f),
-                floatArrayOf(0f, 1f),
-                floatArrayOf(SURROUND_GAIN, 0f),
-                floatArrayOf(0f, SURROUND_GAIN),
+                floatArrayOf(
+                    1f,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    1f,
+                ),
+                floatArrayOf(
+                    SURROUND_GAIN,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    SURROUND_GAIN,
+                ),
             )
+
             5 -> arrayOf( // FL FR FC BL BR
-                floatArrayOf(1f, 0f),
-                floatArrayOf(0f, 1f),
-                floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(SURROUND_GAIN, 0f),
-                floatArrayOf(0f, SURROUND_GAIN),
+                floatArrayOf(
+                    1f,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    1f,
+                ),
+                floatArrayOf(
+                    CENTER_GAIN,
+                    CENTER_GAIN,
+                ),
+                floatArrayOf(
+                    SURROUND_GAIN,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    SURROUND_GAIN,
+                ),
             )
+
             6 -> arrayOf( // FL FR FC LFE BL BR —— 5.1，本机主力片源就是这个
-                floatArrayOf(1f, 0f),
-                floatArrayOf(0f, 1f),
-                floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(LFE_GAIN, LFE_GAIN),
-                floatArrayOf(SURROUND_GAIN, 0f),
-                floatArrayOf(0f, SURROUND_GAIN),
+                floatArrayOf(
+                    1f,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    1f,
+                ),
+                floatArrayOf(
+                    CENTER_GAIN,
+                    CENTER_GAIN,
+                ),
+                floatArrayOf(
+                    LFE_GAIN,
+                    LFE_GAIN,
+                ),
+                floatArrayOf(
+                    SURROUND_GAIN,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    SURROUND_GAIN,
+                ),
             )
+
             7 -> arrayOf( // FL FR FC LFE BC SL SR —— 6.1
-                floatArrayOf(1f, 0f),
-                floatArrayOf(0f, 1f),
-                floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(LFE_GAIN, LFE_GAIN),
-                floatArrayOf(BACK_GAIN, BACK_GAIN),
-                floatArrayOf(SURROUND_GAIN, 0f),
-                floatArrayOf(0f, SURROUND_GAIN),
+                floatArrayOf(
+                    1f,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    1f,
+                ),
+                floatArrayOf(
+                    CENTER_GAIN,
+                    CENTER_GAIN,
+                ),
+                floatArrayOf(
+                    LFE_GAIN,
+                    LFE_GAIN,
+                ),
+                floatArrayOf(
+                    BACK_GAIN,
+                    BACK_GAIN,
+                ),
+                floatArrayOf(
+                    SURROUND_GAIN,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    SURROUND_GAIN,
+                ),
             )
+
             8 -> arrayOf( // FL FR FC LFE BL BR SL SR —— 7.1
-                floatArrayOf(1f, 0f),
-                floatArrayOf(0f, 1f),
-                floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(LFE_GAIN, LFE_GAIN),
-                floatArrayOf(BACK_GAIN, 0f),
-                floatArrayOf(0f, BACK_GAIN),
-                floatArrayOf(SURROUND_GAIN, 0f),
-                floatArrayOf(0f, SURROUND_GAIN),
+                floatArrayOf(
+                    1f,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    1f,
+                ),
+                floatArrayOf(
+                    CENTER_GAIN,
+                    CENTER_GAIN,
+                ),
+                floatArrayOf(
+                    LFE_GAIN,
+                    LFE_GAIN,
+                ),
+                floatArrayOf(
+                    BACK_GAIN,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    BACK_GAIN,
+                ),
+                floatArrayOf(
+                    SURROUND_GAIN,
+                    0f,
+                ),
+                floatArrayOf(
+                    0f,
+                    SURROUND_GAIN,
+                ),
             )
+
             else -> null
         }
 
@@ -440,16 +567,25 @@ internal class DownmixToStereoAudioProcessor(
                 if (index < base.size) {
                     base[index]
                 } else if ((index - base.size) % 2 == 0) {
-                    floatArrayOf(SURROUND_GAIN, 0f)
+                    floatArrayOf(
+                        SURROUND_GAIN,
+                        0f,
+                    )
                 } else {
-                    floatArrayOf(0f, SURROUND_GAIN)
+                    floatArrayOf(
+                        0f,
+                        SURROUND_GAIN,
+                    )
                 }
             }
         }
 
         fun quantize(value: Float): Short {
             val scaled = Math.round(value * 32768f)
-            return scaled.coerceIn(-32768, 32767).toShort()
+            return scaled.coerceIn(
+                -32768,
+                32767,
+            ).toShort()
         }
     }
 }
@@ -538,7 +674,10 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
                 arrayOf(DownmixToStereoAudioProcessor(routePcmChannels)),
             )
             .build()
-        return PassthroughGateAudioSink(speedPcmMode, sink).also { gate ->
+        return PassthroughGateAudioSink(
+            speedPcmMode,
+            sink,
+        ).also { gate ->
             gate.decodeCheck = decodeCheck
             // 注意：这里**不能**预开闸门。
             // 本机的 Dolby 硬解是 bitstream-only（解码出来的仍是 Dolby 码流），
@@ -576,7 +715,10 @@ fun pcmChannelsOfRoute(context: Context): Int {
         val type = device.type
         val isHdmi = type == AudioDeviceInfo.TYPE_HDMI ||
             type == AudioDeviceInfo.TYPE_HDMI_ARC ||
-            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && type == AudioDeviceInfo.TYPE_HDMI_EARC)
+            (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    type == AudioDeviceInfo.TYPE_HDMI_EARC
+                )
         if (isHdmi) sawHdmi = true
         // 只看声明了 PCM 编码的设备；压缩编码的声道数不代表 PCM 能出几路
         val supportsPcm = device.encodings.any {
@@ -590,9 +732,12 @@ fun pcmChannelsOfRoute(context: Context): Int {
     val result = when {
         // 有 HDMI 链路：以 HDMI 为准；HDMI 没报 PCM 声道数 → ARC 只能立体声
         sawHdmi -> if (hdmiChannels > 0) hdmiChannels else STEREO_ROUTE_CHANNELS
+
         else -> anyChannels
     }
-    AudioDiag.log("route pcm channels=$result (any=$anyChannels hdmi=$hdmiChannels sawHdmi=$sawHdmi)")
+    AudioDiag.log(
+        "route pcm channels=$result (any=$anyChannels hdmi=$hdmiChannels sawHdmi=$sawHdmi)",
+    )
     return result
 }
 
@@ -619,7 +764,15 @@ fun canDecodeAudioMime(mimeType: String?, mode: DecoderMode): Boolean {
         .getOrDefault(emptyArray())
     val found = codecList.any { info ->
         if (info.isEncoder) return@any false
-        if (info.supportedTypes.none { it.equals(mimeType, ignoreCase = true) }) return@any false
+        if (info.supportedTypes.none {
+                it.equals(
+                    mimeType,
+                    ignoreCase = true,
+                )
+            }
+        ) {
+            return@any false
+        }
         val hardware = isHardwareCodec(info)
         when {
             requireHardware -> hardware
@@ -642,7 +795,10 @@ private fun isHardwareCodec(info: MediaCodecInfo): Boolean {
     val software = name.startsWith("OMX.google.") ||
         name.startsWith("OMX.ffmpeg.") ||
         name.startsWith("c2.android.") ||
-        name.contains("software", ignoreCase = true)
+        name.contains(
+            "software",
+            ignoreCase = true,
+        )
     return !software
 }
 
@@ -689,7 +845,10 @@ fun forcedAudioCapabilities(context: Context): AudioCapabilities {
     for (encoding in PASSTHROUGH_ENCODINGS) encodings.add(encoding)
     val capabilities = AudioCapabilities(
         encodings.toIntArray(),
-        maxOf(base.maxChannelCount, PASSTHROUGH_MAX_CHANNEL_COUNT),
+        maxOf(
+            base.maxChannelCount,
+            PASSTHROUGH_MAX_CHANNEL_COUNT,
+        ),
     )
     AudioDiag.log("audio capabilities: $capabilities (system reported $base)")
     return capabilities

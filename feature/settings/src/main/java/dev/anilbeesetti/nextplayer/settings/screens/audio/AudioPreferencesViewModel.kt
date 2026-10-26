@@ -54,7 +54,7 @@ class AudioPreferencesViewModel(
             is AudioPreferencesUiEvent.ToggleRequireAudioFocus -> toggleRequireAudioFocus()
 
             is AudioPreferencesUiEvent.ToggleVolumeBoost -> toggleVolumeBoost()
-                    }
+        }
     }
 
     private fun showDialog(value: AudioPreferenceDialog?) {
@@ -100,7 +100,6 @@ class AudioPreferencesViewModel(
             }
         }
     }
-
 }
 
 @Stable

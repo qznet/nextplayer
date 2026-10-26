@@ -87,6 +87,7 @@ import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleDelayMillisecon
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleSpeed
 import io.github.anilbeesetti.nextlib.mediainfo.MediaInfoBuilder
 import java.io.File
+import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -101,7 +102,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import org.koin.android.ext.android.inject
-import kotlin.math.abs
 
 @OptIn(UnstableApi::class)
 class PlayerService : MediaSessionService() {
@@ -303,7 +303,9 @@ class PlayerService : MediaSessionService() {
             var cause: Throwable? = error.cause
             var depth = 0
             while (cause != null && depth < 5) {
-                AudioDiag.log("player error cause[$depth] ${cause.javaClass.simpleName}: ${cause.message}")
+                AudioDiag.log(
+                    "player error cause[$depth] ${cause.javaClass.simpleName}: ${cause.message}",
+                )
                 cause = cause.cause
                 depth++
             }
@@ -420,7 +422,10 @@ class PlayerService : MediaSessionService() {
                 restoreAudioTrackType("tracks changed")
                 reselectHandler.removeCallbacks(restoreAudioTrackRunnable)
                 reselectHandler.removeCallbacks(audioModeVerifyRunnable)
-                reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
+                reselectHandler.postDelayed(
+                    audioModeVerifyRunnable,
+                    AUDIO_MODE_VERIFY_DELAY_MS,
+                )
                 return
             }
             serviceScope.launch {
@@ -1039,7 +1044,10 @@ class PlayerService : MediaSessionService() {
                 AudioDiag.log(
                     "audio mode: 1.0 已稳住，${BITSTREAM_RESTORE_DELAY_MS}ms 后再切回码流",
                 )
-                reselectHandler.postDelayed(bitstreamRestoreRunnable, BITSTREAM_RESTORE_DELAY_MS)
+                reselectHandler.postDelayed(
+                    bitstreamRestoreRunnable,
+                    BITSTREAM_RESTORE_DELAY_MS,
+                )
             }
             return
         }
@@ -1097,14 +1105,20 @@ class PlayerService : MediaSessionService() {
         // 回到 1 倍速的纠正也要走"稳住之后再切"的延迟，否则 enforce 会把刚按下的
         // [BITSTREAM_RESTORE_DELAY_MS] 缓冲直接跳过，连按速度时照样每次闪一下。
         if (!wantDecode && sink.forceDecode) {
-            updateSpeedAudioMode(speed, force = false)
+            updateSpeedAudioMode(
+                speed,
+                force = false,
+            )
             return
         }
         val now = SystemClock.uptimeMillis()
         if (now - audioEnforceAtMs < AUDIO_ENFORCE_MIN_INTERVAL_MS) return
         audioEnforceAtMs = now
         AudioDiag.log("audio mode: out of sync ($reason) gate=${sink.forceDecode} speed=$speed")
-        updateSpeedAudioMode(speed, force = true)
+        updateSpeedAudioMode(
+            speed,
+            force = true,
+        )
     }
 
     private fun requestAudioReselect(reason: String) {
@@ -1113,7 +1127,10 @@ class PlayerService : MediaSessionService() {
             // 不能丢请求：用户常在缓冲/暂停时切速度，丢了就变成"这次调速没反应"
             AudioDiag.log("reselect deferred (state=${player.playbackState}): $reason")
             reselectHandler.removeCallbacks(audioReselectRunnable)
-            reselectHandler.postDelayed(audioReselectRunnable, AUDIO_RESELECT_RETRY_MS)
+            reselectHandler.postDelayed(
+                audioReselectRunnable,
+                AUDIO_RESELECT_RETRY_MS,
+            )
             return
         }
         val now = SystemClock.uptimeMillis()
@@ -1121,7 +1138,10 @@ class PlayerService : MediaSessionService() {
         if (sinceLast in 0 until AUDIO_MODE_MIN_INTERVAL_MS) {
             val delay = AUDIO_MODE_MIN_INTERVAL_MS - sinceLast
             reselectHandler.removeCallbacks(audioReselectRunnable)
-            reselectHandler.postDelayed(audioReselectRunnable, delay)
+            reselectHandler.postDelayed(
+                audioReselectRunnable,
+                delay,
+            )
             AudioDiag.log("reselect deferred ${delay}ms: $reason")
             return
         }
@@ -1145,7 +1165,10 @@ class PlayerService : MediaSessionService() {
                 "reselect re-aimed: gate=${sink.forceDecode} want=$wantDecode " +
                     "(speed=${player.playbackParameters.speed})",
             )
-            updateSpeedAudioMode(player.playbackParameters.speed, force = true)
+            updateSpeedAudioMode(
+                player.playbackParameters.speed,
+                force = true,
+            )
             return@Runnable
         }
         if (sink.isPassthrough != wantDecode) {
@@ -1174,14 +1197,18 @@ class PlayerService : MediaSessionService() {
         }
         if (audioReselectTimes.size >= AUDIO_RESELECT_MAX_PER_WINDOW) {
             val inWindow = now - audioReselectTimes.peekFirst()
-            val wait = (AUDIO_RESELECT_WINDOW_MS - inWindow).coerceAtLeast(0) + AUDIO_RESELECT_RETRY_MS
+            val wait =
+                (AUDIO_RESELECT_WINDOW_MS - inWindow).coerceAtLeast(0) + AUDIO_RESELECT_RETRY_MS
             AudioDiag.log(
                 "audio reselect: rate limited (${audioReselectTimes.size} in ${inWindow}ms), " +
                     "retry in ${wait}ms ($reason)",
             )
             // 延后**重新评估**，不是记仇：期间用户把速度切回去就自动作罢
             reselectHandler.removeCallbacks(audioReselectRunnable)
-            reselectHandler.postDelayed(audioReselectRunnable, wait)
+            reselectHandler.postDelayed(
+                audioReselectRunnable,
+                wait,
+            )
             return
         }
         audioReselectTimes.addLast(now)
@@ -1196,12 +1223,21 @@ class PlayerService : MediaSessionService() {
                 "(window=${audioReselectTimes.size}/$AUDIO_RESELECT_MAX_PER_WINDOW)",
         )
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+            .setTrackTypeDisabled(
+                C.TRACK_TYPE_AUDIO,
+                true,
+            )
             .build()
         reselectHandler.removeCallbacks(restoreAudioTrackRunnable)
-        reselectHandler.postDelayed(restoreAudioTrackRunnable, AUDIO_RESELECT_RESTORE_MS)
+        reselectHandler.postDelayed(
+            restoreAudioTrackRunnable,
+            AUDIO_RESELECT_RESTORE_MS,
+        )
         reselectHandler.removeCallbacks(audioModeVerifyRunnable)
-        reselectHandler.postDelayed(audioModeVerifyRunnable, AUDIO_MODE_VERIFY_DELAY_MS)
+        reselectHandler.postDelayed(
+            audioModeVerifyRunnable,
+            AUDIO_MODE_VERIFY_DELAY_MS,
+        )
     }
 
     private val restoreAudioTrackRunnable = Runnable { restoreAudioTrackType("timeout") }
@@ -1216,7 +1252,10 @@ class PlayerService : MediaSessionService() {
         val player = mediaSession?.player as? ExoPlayer ?: return
         AudioDiag.log("audio track restored ($why)")
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+            .setTrackTypeDisabled(
+                C.TRACK_TYPE_AUDIO,
+                false,
+            )
             .build()
     }
 
@@ -1231,11 +1270,17 @@ class PlayerService : MediaSessionService() {
         if (!sink.forceDecode) return@Runnable
         if (audioTrackDisabledByUs || audioRestartInFlight) {
             // 正卡在另一次重选里，等它落地后再由 enforceAudioMode 收尾
-            reselectHandler.postDelayed(bitstreamRestoreRunnable, AUDIO_RESELECT_RESTORE_MS)
+            reselectHandler.postDelayed(
+                bitstreamRestoreRunnable,
+                AUDIO_RESELECT_RESTORE_MS,
+            )
             return@Runnable
         }
         AudioDiag.log("audio mode: 1.0 稳住，切回码流")
-        updateSpeedAudioMode(player.playbackParameters.speed, force = true)
+        updateSpeedAudioMode(
+            player.playbackParameters.speed,
+            force = true,
+        )
     }
 
     /**
@@ -1307,7 +1352,10 @@ class PlayerService : MediaSessionService() {
             if (!audioTrackDisabledByUs && !audioRestartInFlight) {
                 enforceAudioMode("watchdog")
             }
-            reselectHandler.postDelayed(this, AUDIO_WATCHDOG_INTERVAL_MS)
+            reselectHandler.postDelayed(
+                this,
+                AUDIO_WATCHDOG_INTERVAL_MS,
+            )
         }
     }
 
@@ -1374,7 +1422,10 @@ class PlayerService : MediaSessionService() {
     private fun canDecodeSelectedAudio(): Boolean {
         if (decodeBlockedForItem) return false
         val mime = selectedAudioMime() ?: return true
-        return canDecodeAudioMime(mime, decoderManager.audioMode)
+        return canDecodeAudioMime(
+            mime,
+            decoderManager.audioMode,
+        )
     }
 
     private fun audioModeName(passthrough: Boolean): String =
@@ -1391,7 +1442,13 @@ class PlayerService : MediaSessionService() {
             // 改设置后重开播放器生效（设置页里已写明）。
             // 闸门只拦「真能解码」的格式：本机 ARC 不认 DTS/TrueHD，平台也没有对应解码器，
             // 拦掉它们等于把这条音轨变成静音（开关启用后有的视频没声音就是这么来的）。
-            decodeCheck = { mime -> mime == null || canDecodeAudioMime(mime, decoderManager.audioMode) }
+            decodeCheck =
+                { mime ->
+                    mime == null || canDecodeAudioMime(
+                        mime,
+                        decoderManager.audioMode,
+                    )
+                }
             AudioDiag.log("speed audio mode: passthrough with platform speed")
         }
         speedAudioFactory = renderersFactory
@@ -1472,7 +1529,10 @@ class PlayerService : MediaSessionService() {
 
         // 音频管线看门狗：兜底恢复被我们禁用的音轨、纠正闸门与速度不一致
         reselectHandler.removeCallbacks(audioTrackWatchdog)
-        reselectHandler.postDelayed(audioTrackWatchdog, AUDIO_WATCHDOG_INTERVAL_MS)
+        reselectHandler.postDelayed(
+            audioTrackWatchdog,
+            AUDIO_WATCHDOG_INTERVAL_MS,
+        )
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -1655,7 +1715,11 @@ class PlayerService : MediaSessionService() {
         val player = mediaSession?.player as? ExoPlayer ?: return false
         val shouldPrepare = player.playerError != null
         // 自动降级不写回片源，避免一次偶发失败被永久保存
-        selectDecoder(retry.trackType, retry.mode, persist = false)
+        selectDecoder(
+            retry.trackType,
+            retry.mode,
+            persist = false,
+        )
         if (shouldPrepare && player.mediaItemCount > 0) {
             player.prepare()
         }
@@ -1694,7 +1758,9 @@ class PlayerService : MediaSessionService() {
                     "  track[$index] mime=${format.sampleMimeType} codecs=${format.codecs} " +
                         "${format.width}x${format.height} " +
                         "${format.channelCount}ch/${format.sampleRate}Hz " +
-                        "supported=${group.isTrackSupported(index)} selected=${group.isTrackSelected(index)}",
+                        "supported=${group.isTrackSupported(
+                            index,
+                        )} selected=${group.isTrackSelected(index)}",
                 )
             }
         }
@@ -1759,7 +1825,10 @@ class PlayerService : MediaSessionService() {
                     DecoderTrackType.VIDEO -> mediaItem.copy(videoDecoderMode = mode)
                     DecoderTrackType.AUDIO -> mediaItem.copy(audioDecoderMode = mode)
                 }
-                player.replaceMediaItem(player.currentMediaItemIndex, updatedItem)
+                player.replaceMediaItem(
+                    player.currentMediaItemIndex,
+                    updatedItem,
+                )
             }
         } else {
             AudioDiag.log("decoder fallback: $trackType -> $mode (not persisted)")
