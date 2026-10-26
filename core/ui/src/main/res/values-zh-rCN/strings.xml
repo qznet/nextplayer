@@ -179,8 +179,8 @@
     <string name="format">格式</string>
     <string name="volume_boost_desc">将音量增强到最大 200%</string>
     <string name="volume_boost">音量增强</string>
-    <string name="always_decode_to_stereo">始终解码为 2 声道 PCM</string>
-    <string name="always_decode_to_stereo_desc">关闭：1 倍速仍把压缩码流直通给功放（真正的 5.1 / Atmos），其它速度解码成 2 声道 PCM。跨越 1 倍速时会重建一次音频通路，中间有一声短暂的间断。开启：整场播放都用 PCM，改速度完全不中断，但 1 倍速也只剩 2 声道。重开播放器后生效。</string>
+    <string name="disable_speed_when_passthrough">透传时禁用变速</string>
+    <string name="disable_speed_when_passthrough_desc">关闭（默认）：调速时音频仍然是压缩码流直通给功放（真正的 5.1 / Atmos），并跟着画面一起变速——音调会变，但音画同步。开启：直通时音频保持 1 倍速，倍数失效，画面快声音慢（音画不同步），这是上游原本的行为。重开播放器后生效。</string>
     <string name="pip_settings">画中画模式</string>
     <string name="pip_settings_description">返回主屏幕时自动切换到迷你播放器</string>
     <string name="open_subtitle">打开本地字幕</string>

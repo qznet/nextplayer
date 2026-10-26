@@ -62,17 +62,21 @@ data class PlayerPreferences(
     val passthroughAtAnySpeed: Boolean = false,
 
     /**
-     * 全程解码成 PCM 并折叠 2 声道，不论速度。
+     * 直通状态下是否**禁止**音频变速。
      *
-     * - false（默认）：1 倍速保留压缩码流直通（真正的 5.1 / Atmos），非 1 倍速解码成 2 声道。
-     *   代价是跨越 1 倍速时音频渲染器要重建一次：本机实测约 0.2 秒空档，加上功放重新锁定，
-     *   听感/观感上就是"短暂切了一次立体声"。
-     * - true：整场播放都用 PCM，来回改速度完全不重建、不中断，但 1 倍速也只剩 2 声道。
+     * - false（默认）：倍速时音频仍然是压缩码流直通（功放继续显示 5.1 / Atmos），
+     *   并且音频跟着画面一起变速 —— 音调会变（码流无法保音调地拉伸），
+     *   但音画是同步的。
+     * - true：直通时音频保持 1 倍速，**倍数失效**，画面快声音慢（音画不同步）。
+     *   这是上游原本的默认行为。
+     *
+     * 换句话说：调速时不再把音轨降级成 2 声道 PCM（那条路在实测里功放显示始终是
+     * Atmos、听感也仍是环绕声，等于没换），改为一路直通到底。
      *
      * 只影响压缩音轨（AC3/EAC3/DTS…）；PCM 音源本来就绕开这套逻辑。
      * 建 player 时读取，改设置后要重开播放器。
      */
-    val alwaysDecodeToStereo: Boolean = false,
+    val disableSpeedWhenPassthrough: Boolean = false,
 
     // Subtitle Preferences
     val useSystemCaptionStyle: Boolean = false,

@@ -325,7 +325,6 @@ class PlayerService : MediaSessionService() {
             audioReselectCount = 0
             audioModeRetries = 0
             audioTrackDisabledByUs = false
-            audioPcmLatched = false
             restoreDecoderChoices(mediaItem = mediaItem)
             isMediaItemReady = false
             loadArtworkForCurrentMediaItem()
@@ -596,6 +595,12 @@ class PlayerService : MediaSessionService() {
         override fun onAudioSessionIdChanged(audioSessionId: Int) {
             super.onAudioSessionIdChanged(audioSessionId)
             if (audioSessionId == C.AUDIO_SESSION_ID_UNSET) return
+            // 只在「音量增强」打开时才挂这个 effect。
+            // 它原本是为了让功放显示跟随 PCM 声道数（见 ensureLoudnessEnhancer 的说明），
+            // 但 2026-10-26 定案走直通优先后不再有 PCM 路径，而直通时音频在 offload
+            // 轨道上，挂 AudioEffect 有干扰 AudioTrack 初始化的风险（会变成无声），
+            // 所以恢复成"只有要 boost 时才挂"。
+            if (!playerPreferences.enableVolumeBoost) return
             ensureLoudnessEnhancer(audioSessionId)
         }
     }
@@ -998,85 +1003,27 @@ class PlayerService : MediaSessionService() {
      *   → 整场静音（实测 11:21 那次会话音频渲染器再没 configure 过）。
      * - 否则：非 1 倍速且这条音轨能解码 → true。
      */
-    private fun desiredGateDecode(): Boolean {
-        if (alwaysDecodeToStereo) return audioPcmLatched && canDecodeSelectedAudio()
-        val player = mediaSession?.player ?: return false
-        val speed = player.playbackParameters.speed
-        return abs(speed - 1f) > SPEED_UNITY_EPSILON && canDecodeSelectedAudio()
-    }
 
     private fun updateSpeedAudioMode(speed: Float, force: Boolean = false) {
         val sink = speedAudioFactory?.gateSink ?: return
 
-        // 设置里选了「始终解码成 PCM」：一旦用户调过速就锁在 PCM 模式，
-        // 回到 1 倍速也不再切回码流（这样 1.0↔1.1 来回按不会反复重建音频渲染器）。
-        // 但**首次播放不预开闸门**：先让 sink 正常以直通配置起来（这条路实测稳定），
-        // 等用户真的调速了再切 PCM。
-        if (alwaysDecodeToStereo) {
-            if (abs(speed - 1f) > SPEED_UNITY_EPSILON) {
-                audioPcmLatched = true
-            }
-            val wantDecode = desiredGateDecode()
-            if (sink.forceDecode == wantDecode && !force) return
-            val gateChanged = sink.setForceDecode(wantDecode)
-            if (!gateChanged && !force) return
-            AudioDiag.log(
-                "audio mode: ${if (wantDecode) "decoded" else "pass-through"} " +
-                    "(alwaysDecode latched=$audioPcmLatched at $speed)",
-            )
-            audioModeRetries = 0
-            requestAudioReselect("alwaysDecode speed=$speed")
-            return
-        }
-
-        // PCM 源（AAC / MP3 / FLAC / Opus…）本来就是 PCM 出去，变速由 Sonic 完成，
-        // 重选音轨只会白重建一次音频渲染器（听感上就是每次调速度都断一下）。
-        if (!shouldManageAudioPipeline()) {
+        // 直通优先（2026-10-26 定案）：调速**不**再把音轨降级成 2 声道 PCM。
+        //
+        // 降级那条路（OFFLOAD/E_AC3 6ch → MIXER/PCM_16_BIT 2ch）在 flinger 层与
+        // just-plus-player 逐位一致，但电视的 Dolby 链（Dolby bypass: 0）仍把 PCM
+        // 升混重编码成杜比：功放照样显示 Atmos、听感也仍是环绕声，等于没换，
+        // 还要多付一次音频渲染器重建（跨越 1 倍速时那声"闪一下立体声"）。
+        //
+        // 现在压缩码流一路直通到底：功放一直是真正的 5.1 / Atmos，
+        // 变速交给 AudioTrack（sink 的 askPlatformSpeed）——码流无法保音调地拉伸，
+        // 所以音调会变，但音画是同步的。
+        //
+        // 这里只负责把"上一轮遗留的 PCM 态"收回直通。
+        if (sink.forceDecode) {
+            AudioDiag.log("audio mode: back to pass-through at $speed")
             sink.setForceDecode(false)
-            return
+            requestAudioReselect("back to passthrough")
         }
-
-        val wantDecode = desiredGateDecode()
-        // 回到 1 倍速时不要立刻切回码流。用户在 1.0~1.x 之间连按时，每一次往返都要
-        // 重建音频渲染器、并让功放重新锁定格式，听感上就是"闪一下立体声"。
-        // 只在 1 倍速稳住 [BITSTREAM_RESTORE_DELAY_MS] 之后才切，连按期间一次都不切。
-        if (!wantDecode && !force) {
-            reselectHandler.removeCallbacks(bitstreamRestoreRunnable)
-            if (sink.forceDecode) {
-                AudioDiag.log(
-                    "audio mode: 1.0 已稳住，${BITSTREAM_RESTORE_DELAY_MS}ms 后再切回码流",
-                )
-                reselectHandler.postDelayed(bitstreamRestoreRunnable, BITSTREAM_RESTORE_DELAY_MS)
-            }
-            return
-        }
-        reselectHandler.removeCallbacks(bitstreamRestoreRunnable)
-
-        // 音频解码器**不动**：保持 AUTO（系统 Dolby 硬解）。
-        // 参照物 just-plus-player 在倍速时就是这么干的——它没有 FFmpeg，
-        // 纯 media3 的 MediaCodecAudioRenderer 用系统硬解把 E-AC3 解成 PCM 输出，
-        // 实测 HAL 侧正是 'MIXER + PCM_16_BIT + 2ch'（与 1.0x 的 OFFLOAD/E_AC3 相对）。
-        // 曾想改成 DecoderMode.FFMPEG 软解（怕系统硬解是 bitstream-only），
-        // 但 just+ 的实测已经证明系统硬解能输出 PCM，而且软解音质更差、
-        // 送进 HAL 的 PCM 与参照物不一致 —— 没有理由偏离。
-        val gateChanged = sink.setForceDecode(wantDecode)
-        if (!gateChanged && !force) return
-
-        val wantPassthrough = !wantDecode
-        if (!gateChanged && sink.isPassthrough == wantPassthrough) {
-            audioModeRetries = 0
-            return
-        }
-        AudioDiag.log(
-            "audio mode: want ${audioModeName(wantPassthrough)} at $speed " +
-                "(gateChanged=$gateChanged actual=${audioModeName(sink.isPassthrough)})",
-        )
-        audioModeRetries = 0
-        requestAudioReselect("speed=$speed")
-        // 切到 PCM 之后把 LoudnessEnhancer 挂上：直通态音频在 offload 线程上挂不了
-        // effect，切到 PCM（MIXER 线程）才是它能待的地方 —— 这条 Effect Chain 关系到
-        // 功放显示能不能跟着声道数变，见 ensureLoudnessEnhancer 的说明。
-        if (wantDecode) ensureLoudnessEnhancer()
     }
 
     /** 事件驱动对齐：任何时刻发现闸门与当前速度不符就纠正，不依赖速度回调是否来过。 */
@@ -1094,27 +1041,14 @@ class PlayerService : MediaSessionService() {
             }
             return
         }
-        // 「始终解码」模式下没有"按速度切管线"这回事，闸门由 updateSpeedAudioMode 独占，
-        // 这里再插手就会和它互相覆盖（曾经每 2~3 秒翻一次闸门，音频被反复重建）。
-        if (alwaysDecodeToStereo) return
-        if (!shouldManageAudioPipeline()) {
-            sink.setForceDecode(false)
-            return
+        // 直通优先：闸门不再因调速而开。这里只负责把"上一轮遗留的 PCM 态"收回直通。
+        if (sink.forceDecode) {
+            val now = SystemClock.uptimeMillis()
+            if (now - audioEnforceAtMs < AUDIO_ENFORCE_MIN_INTERVAL_MS) return
+            audioEnforceAtMs = now
+            AudioDiag.log("audio mode: out of sync ($reason) gate=${sink.forceDecode}")
+            updateSpeedAudioMode(player.playbackParameters.speed, force = true)
         }
-        val speed = player.playbackParameters.speed
-        val wantDecode = desiredGateDecode()
-        if (sink.forceDecode == wantDecode) return
-        // 回到 1 倍速的纠正也要走"稳住之后再切"的延迟，否则 enforce 会把刚按下的
-        // [BITSTREAM_RESTORE_DELAY_MS] 缓冲直接跳过，连按速度时照样每次闪一下。
-        if (!wantDecode && sink.forceDecode) {
-            updateSpeedAudioMode(speed, force = false)
-            return
-        }
-        val now = SystemClock.uptimeMillis()
-        if (now - audioEnforceAtMs < AUDIO_ENFORCE_MIN_INTERVAL_MS) return
-        audioEnforceAtMs = now
-        AudioDiag.log("audio mode: out of sync ($reason) gate=${sink.forceDecode} speed=$speed")
-        updateSpeedAudioMode(speed, force = true)
     }
 
     private fun requestAudioReselect(reason: String) {
@@ -1225,12 +1159,6 @@ class PlayerService : MediaSessionService() {
         audioRestartInFlight = false
         restoreAudioTrackType("verify")
 
-        // 「始终解码」模式下管路全程不变，没有任何东西需要校验。
-        if (alwaysDecodeToStereo) {
-            audioModeRetries = 0
-            return@Runnable
-        }
-
         if (!shouldManageAudioPipeline()) return@Runnable
         if (!player.isPlaying) return@Runnable
 
@@ -1334,7 +1262,6 @@ class PlayerService : MediaSessionService() {
      */
     private fun shouldManageAudioPipeline(): Boolean {
         val sink = speedAudioFactory?.gateSink ?: return false
-        if (alwaysDecodeToStereo) return false
         if (sink.passthroughEverSeen || sink.isPassthrough) return true
         val mime = selectedAudioMime() ?: return false
         return mime in PASSTHROUGH_MIME_TYPES
@@ -1359,13 +1286,15 @@ class PlayerService : MediaSessionService() {
             setDecoderManager(decoderManager = decoderManager)
             // sink 的输出配置在建 player 时定死，所以这里是唯一能设进去的时机。
             // 改设置后重开播放器生效（设置页里已写明）。
-            alwaysDecodeToStereo = playerPreferences.alwaysDecodeToStereo
+            disableSpeedWhenPassthrough = playerPreferences.disableSpeedWhenPassthrough
             // 闸门只拦「真能解码」的格式：本机 ARC 不认 DTS/TrueHD，平台也没有对应解码器，
             // 拦掉它们等于把这条音轨变成静音（开关启用后有的视频没声音就是这么来的）。
             decodeCheck = { mime -> mime == null || canDecodeAudioMime(mime, decoderManager.audioMode) }
-            AudioDiag.log("speed audio mode: alwaysDecodeToStereo=$alwaysDecodeToStereo")
+            AudioDiag.log(
+                "speed audio mode: disableSpeedWhenPassthrough=$disableSpeedWhenPassthrough",
+            )
         }
-        this@PlayerService.alwaysDecodeToStereo = playerPreferences.alwaysDecodeToStereo
+        this@PlayerService.disableSpeedWhenPassthrough = playerPreferences.disableSpeedWhenPassthrough
         speedAudioFactory = renderersFactory
 
         trackSelector = DefaultTrackSelector(applicationContext).apply {

@@ -362,16 +362,12 @@ internal class DownmixToStereoAudioProcessor(
         const val SURROUND_GAIN = 0.7071f
 
         /**
-         * LFE 折叠增益：**0 = 直接丢弃**。
+         * LFE 折叠增益 -9dB。
          *
-         * 原来这里保留 -9dB（0.354）的低频能量，理由是"丢弃后听感发薄"。
-         * 但 2026-10-26 的同机对照给出了更重要的理由：电视的 Dolby 链
-         * （`Dolby bypass: 0`）会按**内容**判断要不要升混成 5.1 杜比，
-         * 带低频能量的双声道被判成环绕内容 → 功放一直显示 Atmos/透传。
-         * 参考实现 just-plus-player 的矩阵里 LFE 是 `{0, 0}`（完全丢弃），
-         * 它在同机同片源上能让功放显示立体声。现在与它完全对齐。
+         * Dolby 规范里 2.0 折叠默认丢弃 LFE；但实测丢弃后整体听感明显发薄，
+         * 所以保留一点点低频能量。取值足够低，配合 [HEADROOM] 与 [bend] 不会过载。
          */
-        const val LFE_GAIN = 0f
+        const val LFE_GAIN = 0.354f
 
         /** 输出余量 -6dB，给软限幅器留头。 */
         const val HEADROOM = 0.5f
@@ -411,7 +407,7 @@ internal class DownmixToStereoAudioProcessor(
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(0f, 0f),
+                floatArrayOf(LFE_GAIN, LFE_GAIN),
                 floatArrayOf(SURROUND_GAIN, 0f),
                 floatArrayOf(0f, SURROUND_GAIN),
             )
@@ -419,7 +415,7 @@ internal class DownmixToStereoAudioProcessor(
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(0f, 0f),
+                floatArrayOf(LFE_GAIN, LFE_GAIN),
                 floatArrayOf(BACK_GAIN, BACK_GAIN),
                 floatArrayOf(SURROUND_GAIN, 0f),
                 floatArrayOf(0f, SURROUND_GAIN),
@@ -428,7 +424,7 @@ internal class DownmixToStereoAudioProcessor(
                 floatArrayOf(1f, 0f),
                 floatArrayOf(0f, 1f),
                 floatArrayOf(CENTER_GAIN, CENTER_GAIN),
-                floatArrayOf(0f, 0f),
+                floatArrayOf(LFE_GAIN, LFE_GAIN),
                 floatArrayOf(BACK_GAIN, 0f),
                 floatArrayOf(0f, BACK_GAIN),
                 floatArrayOf(SURROUND_GAIN, 0f),
@@ -488,7 +484,14 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
      * 直通↔解码的切换，也就没有那 0.2 秒重建空档。代价是 1 倍速也只剩 2 声道。
      */
     @Volatile
-    var alwaysDecodeToStereo: Boolean = false
+    /**
+     * 直通时是否禁止变速（设置里的「透传时禁用变速」）。
+     *
+     * false（默认）：直通状态下音频跟着画面变速 —— 码流无法保音调地拉伸，
+     *   所以音调会变，但音画同步。
+     * true：直通时音频保持 1 倍速，倍数失效（上游原本的行为，音画不同步）。
+     */
+    var disableSpeedWhenPassthrough: Boolean = false
 
     /** 「这条 mime 在本机能不能解码」，由 service 按当前解码器模式注入，闸门据此决定拦不拦。 */
     @Volatile
@@ -524,15 +527,16 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
         enableAudioOutputPlaybackParameters: Boolean,
     ): AudioSink? {
         sinkBuildCount++
-        // 变速一律由 Sonic 在 PCM 域完成。直通分支只有在 app 明确要求时才会接受
-        // AudioTrack 变速（media3 1.11.1 注释原话 "we only enable it this was specifically
-        // requested by the app"），而本机 HAL 对压缩流变速只"受理"不实现（实测静音），
-        // 所以这里不给它这个权限 —— 传进来的值上游一直是 false，写在这里是为了别被改回 true。
-        val askPlatformSpeed = false
+        // 直通分支要不要接受 AudioTrack 变速。
+        // media3 1.11.1 注释原话："we only enable it this was specifically requested by the app"，
+        // 所以这里必须由 app 主动要。给了之后：压缩码流仍原样送给功放（5.1 / Atmos），
+        // 而 AudioTrack 按变速率重采样输出 —— 音调会变，但音画同步。
+        // 关掉它（设置里的「透传时禁用变速」）就退回上游行为：直通时音频恒 1 倍速。
+        val askPlatformSpeed = !disableSpeedWhenPassthrough
         AudioDiag.log(
             "buildAudioSink #$sinkBuildCount (float=$enableFloatOutput " +
                 "upstreamPlaybackParams=$enableAudioOutputPlaybackParameters " +
-                "alwaysDecode=$alwaysDecodeToStereo)",
+                "disableSpeedWhenPassthrough=$disableSpeedWhenPassthrough)",
         )
         val builder = DefaultAudioSink.Builder(context)
         // 对齐 just-plus-player（电视上实测能跟着倍速动态切换的那版）的做法：
@@ -549,7 +553,7 @@ class SpeedAwareRenderersFactory(context: Context) : NextRenderersFactory(contex
             .build()
         return PassthroughGateAudioSink(speedPcmMode, sink).also { gate ->
             gate.decodeCheck = decodeCheck
-            // 注意：这里**不能**按 alwaysDecodeToStereo 预开闸门。
+            // 注意：这里**不能**预开闸门。
             // 本机的 Dolby 硬解是 bitstream-only（解码出来的仍是 Dolby 码流），
             // 闸门预开时 media3 首次选轨就判定"要转码"，而唯一的解码器给出的还是
             // 码流 → sink 拒绝非 raw → 音轨被取消选择 → 整场静音
