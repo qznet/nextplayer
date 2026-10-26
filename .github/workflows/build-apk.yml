@@ -11,7 +11,12 @@ on:
           - all
         default: v7a
   schedule:
-    - cron: "0 18 * * *"   # UTC 18:00 = 北京时间 02:00 每日
+    # 每月 1 号跑一次同步上游。日常构建一律手 workflow_dispatch，
+    # 不要提速到每天：上游一有改动就会撞冲突，冲突时本 workflow 主动 exit 1
+    # （见 Sync upstream 步骤），高频触发只会刷出一堆必然失败的记录。
+    # 时区注意：cron 是 UTC，UTC 1 日 01:00 = 北京时间 1 日 09:00；
+    # 若写成 18:00 UTC，落到北京已经是 2 号凌晨了。
+    - cron: "0 1 1 * *"   # UTC 每月 1 日 01:00 = 北京时间每月 1 日 09:00
 
 permissions:
   contents: write
