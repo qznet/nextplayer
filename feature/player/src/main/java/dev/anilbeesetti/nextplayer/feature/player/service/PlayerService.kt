@@ -991,32 +991,29 @@ class PlayerService : MediaSessionService() {
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
         mediaSession
 
-    /**
-     * 按播放速度对齐音频管线：1 倍速直通压缩音轨（AC3 / E-AC3），其它速度解码 + 折叠 2 声道。
-     *
-     * 光改闸门不够。media3 不会因为变速重新决策"直通还是解码"——
-     * `MediaCodecAudioRenderer.setPlaybackParameters` 只是把参数转发给 `AudioSink`
-     * （已用 1.11.1 字节码确认），渲染器不会重建解码器。必须让音频渲染器重新选轨，
-     * `shouldUseBypass` 才会按新闸门重算。
-     *
-     * 重选手段是临时禁用音轨类型。**恢复绝不能依赖 `onTracksChanged`**：
-     * 目标机（TCL m7642 / Android 9）实测出现过回调不来、`currentTracks` 的 selected
-     * 标志也没及时更新，结果音轨永久停在 disabled —— 表现就是"画面在走、没有声音，
-     * 1 倍速也一直是立体声 PCM"。所以这里改成三道保险，且全部幂等：
-     * 1. 禁用后固定 [AUDIO_RESELECT_RESTORE_MS] 无条件恢复；
-     * 2. `onTracksChanged` 来了就提前恢复；
-     * 3. [audioTrackWatchdog] 每 [AUDIO_WATCHDOG_INTERVAL_MS] 兜底检查。
-     *
-     * 另外速度回调本身也可能漏（播放器重建后 speed 回到 1.0 而闸门还停在解码态），
-     * 所以还有 [enforceAudioMode] 在关键时机按当前 speed 强制对齐。
-     */
+    // 按播放速度对齐音频管线：1 倍速直通压缩音轨（AC3 / E-AC3），其它速度解码 + 折叠 2 声道。
+    //
+    // 光改闸门不够。media3 不会因为变速重新决策"直通还是解码"——
+    // MediaCodecAudioRenderer.setPlaybackParameters 只是把参数转发给 AudioSink
+    // （已用 1.11.1 字节码确认），渲染器不会重建解码器。必须让音频渲染器重新选轨，
+    // shouldUseBypass 才会按新闸门重算。
+    //
+    // 重选手段是临时禁用音轨类型。**恢复绝不能依赖 onTracksChanged**：
+    // 目标机（TCL m7642 / Android 9）实测出现过回调不来、currentTracks 的 selected
+    // 标志也没及时更新，结果音轨永久停在 disabled —— 表现就是"画面在走、没有声音，
+    // 1 倍速也一直是立体声 PCM"。所以这里改成三道保险，且全部幂等：
+    // 1. 禁用后固定 AUDIO_RESELECT_RESTORE_MS 无条件恢复；
+    // 2. onTracksChanged 来了就提前恢复；
+    // 3. audioTrackWatchdog 每 AUDIO_WATCHDOG_INTERVAL_MS 兜底检查。
+    //
+    // 另外速度回调本身也可能漏（播放器重建后 speed 回到 1.0 而闸门还停在解码态），
+    // 所以还有 enforceAudioMode 在关键时机按当前 speed 强制对齐。
 
     /**
      * 闸门此刻**应该**处于的状态——唯一判据。
      *
-     * - 「调速时降级为 2 声道 PCM」打开：非 1 倍速且这条音轨能解码 → true
-     *   （解不了就别拦，宁可速度不生效也不能静音）。
-     * - 关闭（默认）：恒为 false —— 全程直通，调速不动音频通路。
+     * 非 1 倍速且这条音轨能解码 → true（解不了就别拦，宁可速度不生效也不能静音）。
+     * 1 倍速恒为 false —— 全程直通，调速不动音频通路。
      */
     private fun desiredGateDecode(): Boolean {
         val player = mediaSession?.player ?: return false
@@ -1747,8 +1744,10 @@ class PlayerService : MediaSessionService() {
         // 本机 logcat 拿不到应用日志：把"为什么判不支持"落盘，否则只能看到最终 UI 文案
         AudioDiag.log(
             "unsupported track: type=$trackType " +
-                "requestedVideo=${decoderManager.videoMode} activeVideo=${decoderManager.activeVideoMode} " +
-                "requestedAudio=${decoderManager.audioMode} activeAudio=${decoderManager.activeAudioMode} " +
+                "requestedVideo=${decoderManager.videoMode} " +
+                "activeVideo=${decoderManager.activeVideoMode} " +
+                "requestedAudio=${decoderManager.audioMode} " +
+                "activeAudio=${decoderManager.activeAudioMode} " +
                 "unmapped=${trackSelector.unmappedTrackCount(mediaTrackType)}",
         )
         for (group in groups) {
