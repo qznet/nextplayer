@@ -49,6 +49,19 @@ class NetworkSessions(
         client = null
     }
 
+    /**
+     * Force-drops the current client so the next [target] builds a brand-new connection.
+     *
+     * Used by [dev.anilbeesetti.nextplayer.core.media.network.datasource.NetworkDataSource] when a
+     * read fails mid-playback: the shared [NetworkClient.isConnected] check can't see a silently
+     * dropped TCP socket, so we must throw the old client away and reconnect for real.
+     */
+    suspend fun reconnect() = mutex.withLock {
+        client?.let(block = ::disconnectDetached)
+        connection = null
+        client = null
+    }
+
     private suspend fun resolve(uri: Uri): NetworkUri.Target {
         val connectionId = NetworkUri.connectionIdOf(uri = uri)
             ?: return NetworkUri.adHocTargetOf(uri = uri)

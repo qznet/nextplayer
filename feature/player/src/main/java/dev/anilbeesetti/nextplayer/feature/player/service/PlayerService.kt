@@ -6,6 +6,7 @@ import android.content.Intent
 import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -528,6 +529,12 @@ class PlayerService : MediaSessionService() {
 
         override fun onPlayerError(error: PlaybackException) {
             if (!error.isDecoderFailure) {
+                // 数据源错误（SMB 断流等）原本完全不打日志，logcat 抓不到根因。这里落盘 + logcat 双写。
+                Log.e(
+                    "PlayerService",
+                    "non-decoder player error: code=${error.errorCodeName} msg=${error.message}",
+                    error,
+                )
                 decoderRecoveryManager.onNonDecoderError()
                 return
             }
