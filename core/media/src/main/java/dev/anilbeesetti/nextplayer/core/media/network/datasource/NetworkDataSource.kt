@@ -105,22 +105,29 @@ class NetworkDataSource(private val sessions: NetworkSessions) : BaseDataSource(
                 if (bytesRemaining != C.LENGTH_UNSET.toLong()) bytesRemaining -= bytesRead
                 bytesTransferred(bytesRead)
                 return bytesRead
-            } catch (e: IOException) {
+            } catch (e: Exception) {
+                // smbj throws SMBRuntimeException (a RuntimeException, NOT IOException) when the shared
+                // DiskShare was closed; catching only IOException would miss it and surface a "Source error".
                 if (attempt >= READ_RETRY_COUNT) {
                     Log.e(
                         TAG,
-                        "read() failed after $attempt retries at byte $resumePosition",
+                        "read() failed after $attempt retries at byte $resumePosition (${e::class.simpleName})",
                         e,
                     )
-                    throw e
+                    throw IOException("read failed at $resumePosition", e)
                 }
                 attempt++
                 Log.w(
                     TAG,
-                    "read() failed at byte $resumePosition, reconnecting (attempt $attempt)",
+                    "read() failed at byte $resumePosition (attempt $attempt, ${e::class.simpleName}), reconnecting",
                     e,
                 )
-                recoverStream()
+                try {
+                    recoverStream()
+                } catch (re: Exception) {
+                    Log.e(TAG, "recoverStream failed at byte $resumePosition", re)
+                    throw IOException("recover failed at $resumePosition", re)
+                }
             }
         }
     }

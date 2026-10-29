@@ -44,6 +44,14 @@ class SmbClient internal constructor(
     private var client: SMBClient? = null
     private var smbConnection: Connection? = null
     private var session: Session? = null
+    /**
+     * Cached per-share [DiskShare]. This belongs to the [session], NOT to any single [InputStream]
+     * returned by [openStream]. smbj returns the same cached DiskShare for a given share name, so if a
+     * stream's close() also closed the share, a concurrent/next stream would read a dead share and get
+     * "DiskShare has already been closed". We therefore let this client own the share lifecycle and
+     * only close individual files inside the stream.
+     */
+    private val shares = mutableMapOf<String, DiskShare>()
 
     private val shareName: String get() = connection.path.trim('/')
     private val isServerRoot: Boolean get() = connection.path == "/"
@@ -119,6 +127,8 @@ class SmbClient internal constructor(
     override suspend fun disconnect() = withContext(Dispatchers.IO) { closeResources() }
 
     private fun closeResources() {
+        shares.values.forEach { runCatching { it.close() } }
+        shares.clear()
         runCatching { session?.close() }
         runCatching { smbConnection?.close() }
         runCatching { client?.close() }
@@ -178,16 +188,15 @@ class SmbClient internal constructor(
             if (!isConnected()) connect().getOrThrow()
             val sess = session ?: error(message = "Not connected")
             val (selectedShare, sharePath) = shareAndPath(path = path)
-            val share = sess.connectShare(selectedShare) as DiskShare
-            val file = try {
-                openReadFile(
-                    share = share,
-                    path = sharePath,
-                )
-            } catch (error: Throwable) {
-                runCatching { share.close() }
-                throw error
+            // Reuse the cached DiskShare for this share name. It is owned by the session and must
+            // outlive any single stream — only individual files get closed when a stream ends.
+            val share = shares[selectedShare] ?: run {
+                (sess.connectShare(selectedShare) as DiskShare).also { shares[selectedShare] = it }
             }
+            val file = openReadFile(
+                share = share,
+                path = sharePath,
+            )
 
             val rawStream = object : InputStream() {
                 private var position = offset
@@ -218,8 +227,9 @@ class SmbClient internal constructor(
                 }
 
                 override fun close() {
+                    // Only close the file. The DiskShare is shared/session-owned and is closed by
+                    // closeResources() on disconnect/reconnect, never by an individual stream.
                     runCatching { file.close() }
-                    runCatching { share.close() }
                 }
             }
 
