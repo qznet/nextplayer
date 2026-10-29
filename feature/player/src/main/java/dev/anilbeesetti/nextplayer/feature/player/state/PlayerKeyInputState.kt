@@ -163,9 +163,13 @@ internal class PlayerKeyInputState(
             }
 
             Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
-                val controlsWereHidden = !controls.controlsVisible
-                controls.showControls()
-                controlsWereHidden
+                val wereHidden = !controls.controlsVisible
+                if (wereHidden) {
+                    // 播放中控制栏隐藏：一次 OK 直接暂停/继续，而不是先只弹出控制栏。
+                    togglePlayPause()
+                    controls.showControls()
+                }
+                wereHidden
             }
 
             Key.DirectionLeft -> {

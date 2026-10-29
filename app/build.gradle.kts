@@ -15,8 +15,8 @@ android {
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         applicationId = "dev.anilbeesetti.nextplayer"
-        versionCode = 77
-        versionName = "0.19.2"
+        versionCode = 78
+        versionName = "0.19.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
