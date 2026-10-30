@@ -112,6 +112,6 @@ jobs:
           )
           gh release create latest \
             --target main \
-            --title "NextPlayer TV 版 v0.19.1（上下键倍速 + 按速度切换音频管线）" \
+            --title "NextPlayer TV 版 v0.19.5（上下键倍速 + 按速度切换音频管线 + dpadUpDown 可选调速）" \
             --notes "$NOTES" \
             app/build/outputs/apk/release-with-debug-signing/*.apk
