@@ -113,8 +113,12 @@ class SmbClient internal constructor(
                     // Test enumeration as well as authentication before saving a server root.
                     listShares(sess)
                 } else {
-                    (sess.connectShare(shareName) as? DiskShare)?.use { it.list("") }
-                        ?: error(message = "Share '$shareName' is not a disk share")
+                    // Probe that the share is a readable disk share, but KEEP it open and cached
+                    // (via getShare) so openStream reuses the exact same connected DiskShare.
+                    // Closing it here made smbj hand back a stale "already closed" TreeConnect.
+                    val share = getShare(name = shareName)
+                    runCatching { share.list(smbPath(relative = "")) }
+                        .onFailure { throw IllegalStateException("Share '$shareName' is not readable", it) }
                 }
             } catch (error: Throwable) {
                 closeResources()
@@ -137,48 +141,68 @@ class SmbClient internal constructor(
         client = null
     }
 
+    /**
+     * Returns the cached [DiskShare] for [name], creating and caching it on first use.
+     *
+     * The share is owned by this client and closed only by [closeResources] — never per operation —
+     * so the connect-time probe, every [openStream], [listFiles] and [fileSize] all reuse the same
+     * live connection.
+     *
+     * Why this matters: smbj caches a TreeConnect per share name. The old code did
+     * `connectShare(name).use { list("") }` during [connect], which closed the share, and then the
+     * next `connectShare` returned that *stale, already-closed* cached object — causing
+     * "DiskShare has already been closed" on the very first open. Keeping the share open and reusing
+     * our own cache sidesteps that entirely.
+     */
+    private fun getShare(name: String): DiskShare {
+        shares[name]?.let { return it }
+        val sess = session ?: error(message = "Not connected")
+        val disk = (sess.connectShare(name) as? DiskShare)
+            ?: error(message = "Share '$name' is not a disk share")
+        shares[name] = disk
+        return disk
+    }
+
     override fun isConnected(): Boolean = session != null && smbConnection?.isConnected == true
 
     override suspend fun listFiles(path: String): Result<List<NetworkFile>> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val sess = session ?: error(message = "Not connected")
                 val relative = path.trim('/')
-                if (isServerRoot && relative.isEmpty()) return@runCatching listShares(sess)
+                if (isServerRoot && relative.isEmpty()) {
+                    return@runCatching listShares(session ?: error(message = "Not connected"))
+                }
                 val (selectedShare, sharePath) = shareAndPath(path = path)
-                (sess.connectShare(selectedShare) as DiskShare).use { share ->
-                    share.list(smbPath(relative = sharePath)).mapNotNull { info ->
-                        val name = info.fileName
-                        if (name == "." || name == ".." ||
-                            name.endsWith(suffix = "$")
-                        ) {
-                            return@mapNotNull null
-                        }
-                        // FILE_ATTRIBUTE_DIRECTORY
-                        val isDirectory = info.fileAttributes and 0x10L != 0L
-                        NetworkFile(
-                            name = name,
-                            path = if (relative.isEmpty()) name else "$relative/$name",
-                            isDirectory = isDirectory,
-                            size = if (isDirectory) 0 else info.endOfFile,
-                            modified = info.lastWriteTime?.toEpochMillis(),
-                        )
+                val share = getShare(name = selectedShare)
+                share.list(smbPath(relative = sharePath)).mapNotNull { info ->
+                    val name = info.fileName
+                    if (name == "." || name == ".." ||
+                        name.endsWith(suffix = "$")
+                    ) {
+                        return@mapNotNull null
                     }
+                    // FILE_ATTRIBUTE_DIRECTORY
+                    val isDirectory = info.fileAttributes and 0x10L != 0L
+                    NetworkFile(
+                        name = name,
+                        path = if (relative.isEmpty()) name else "$relative/$name",
+                        isDirectory = isDirectory,
+                        size = if (isDirectory) 0 else info.endOfFile,
+                        modified = info.lastWriteTime?.toEpochMillis(),
+                    )
                 }
             }
         }
 
     override suspend fun fileSize(path: String): Long = withContext(Dispatchers.IO) {
         runCatching {
-            val sess = session ?: error(message = "Not connected")
             val (selectedShare, sharePath) = shareAndPath(path = path)
-            (sess.connectShare(selectedShare) as DiskShare).use { share ->
-                openReadFile(
-                    share = share,
-                    path = sharePath,
-                ).use {
-                    it.fileInformation.standardInformation.endOfFile
-                }
+            val share = getShare(name = selectedShare)
+            openReadFile(
+                share = share,
+                path = sharePath,
+            ).use {
+                it.fileInformation.standardInformation.endOfFile
             }
         }.getOrDefault(defaultValue = -1L)
     }
@@ -186,13 +210,10 @@ class SmbClient internal constructor(
     override suspend fun openStream(path: String, offset: Long): InputStream =
         withContext(Dispatchers.IO) {
             if (!isConnected()) connect().getOrThrow()
-            val sess = session ?: error(message = "Not connected")
             val (selectedShare, sharePath) = shareAndPath(path = path)
             // Reuse the cached DiskShare for this share name. It is owned by the session and must
             // outlive any single stream — only individual files get closed when a stream ends.
-            val share = shares[selectedShare] ?: run {
-                (sess.connectShare(selectedShare) as DiskShare).also { shares[selectedShare] = it }
-            }
+            val share = getShare(name = selectedShare)
             val file = openReadFile(
                 share = share,
                 path = sharePath,
