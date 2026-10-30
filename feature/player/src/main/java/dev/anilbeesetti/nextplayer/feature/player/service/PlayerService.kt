@@ -13,6 +13,7 @@ import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
+import androidx.media3.common.BundleListRetriever
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -987,6 +988,10 @@ class PlayerService : MediaSessionService() {
                     return@future SessionResult(SessionResult.RESULT_SUCCESS)
                 }
 
+                CustomCommands.START_BACKGROUND_PLAYBACK -> {
+                    return@future startBackgroundPlayback(session, args)
+                }
+
                 CustomCommands.STOP_PLAYER_SESSION -> {
                     savePositionAndStopSession()
                     return@future SessionResult(SessionResult.RESULT_SUCCESS)
@@ -997,6 +1002,73 @@ class PlayerService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
         mediaSession
+
+    private var playbackRequestGeneration = 0L
+
+    private suspend fun startBackgroundPlayback(
+        session: MediaSession,
+        args: Bundle,
+    ): SessionResult {
+        val requestGeneration = ++playbackRequestGeneration
+        val items = try {
+            val binder = args.getBinder(CustomCommands.BACKGROUND_MEDIA_ITEMS_KEY)
+                ?: return SessionResult(SessionError.ERROR_BAD_VALUE)
+            withContext(Dispatchers.Default) {
+                BundleListRetriever.getList(binder).map { MediaItem.fromBundle(it) }
+            }
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            return SessionResult(SessionError.ERROR_BAD_VALUE)
+        }
+        val index = args.getInt(CustomCommands.BACKGROUND_START_INDEX_KEY, 0)
+        val position = args.getLong(CustomCommands.BACKGROUND_START_POSITION_KEY, C.TIME_UNSET)
+
+        @Suppress("DEPRECATION")
+        val speed = (args.get(CustomCommands.PLAYBACK_SPEED_KEY) as? Number)?.toFloat()
+        if (items.isEmpty() || index !in items.indices ||
+            items.any { it.localConfiguration?.uri == null } ||
+            (position < 0 && position != C.TIME_UNSET) ||
+            (
+                args.containsKey(CustomCommands.PLAYBACK_SPEED_KEY) &&
+                    (speed == null || !speed.isFinite() || speed <= 0)
+                )
+        ) {
+            return SessionResult(SessionError.ERROR_BAD_VALUE)
+        }
+        if (requestGeneration != playbackRequestGeneration || mediaSession !== session) {
+            return SessionResult(SessionError.ERROR_INVALID_STATE)
+        }
+        cancelPendingMediaItems()
+        val generation = ++playbackRequestGeneration
+        val updatedItems = withContext(Dispatchers.Default) {
+            updatedMediaItemsWithMetadata(items)
+        }
+        if (generation != playbackRequestGeneration || mediaSession !== session) {
+            return SessionResult(SessionError.ERROR_INVALID_STATE)
+        }
+        return session.player.run {
+            setMediaItems(updatedItems, index, position)
+            speed?.let(::setPlaybackSpeed)
+            prepare()
+            play()
+            SessionResult(
+                SessionResult.RESULT_SUCCESS,
+                Bundle().apply {
+                    putString(
+                        CustomCommands.BACKGROUND_MEDIA_URI_KEY,
+                        currentMediaItem?.localConfiguration?.uri?.toString(),
+                    )
+                    putLong(CustomCommands.BACKGROUND_POSITION_KEY, currentPosition)
+                    putLong(CustomCommands.BACKGROUND_DURATION_KEY, duration)
+                },
+            )
+        }
+    }
+
+    private fun cancelPendingMediaItems() {
+        // 本 fork 的 onSetMediaItems/onAddMediaItems 为同步返回，无待处理请求；
+        // 保持与上游同名的空实现，使 startBackgroundPlayback 的守卫调用可编译且语义一致。
+    }
 
     // 按播放速度对齐音频管线：1 倍速直通压缩音轨（AC3 / E-AC3），其它速度解码 + 折叠 2 声道。
     //
