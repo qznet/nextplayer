@@ -1,6 +1,7 @@
 package dev.anilbeesetti.nextplayer.feature.player.state
 
 import android.content.Context
+import android.media.AudioManager
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.compose.runtime.Composable
@@ -38,13 +39,16 @@ internal fun rememberPlayerKeyInputState(
     player: Player,
     controls: ControlsVisibilityState,
     seekIncrementMs: Long,
+    dpadUpDown: Int? = null,
 ): PlayerKeyInputState {
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current.applicationContext
+    val audioManager = LocalContext.current.getSystemService(AudioManager::class.java)
     val state = remember(
         player,
         controls,
         seekIncrementMs,
+        dpadUpDown,
     ) {
         PlayerKeyInputState(
             player = player,
@@ -52,7 +56,14 @@ internal fun rememberPlayerKeyInputState(
             seekIncrementMs = seekIncrementMs,
             coroutineScope = coroutineScope,
             context = context,
-        )
+            dpadUpDown = dpadUpDown,
+        ) { up ->
+            audioManager.adjustStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+                AudioManager.FLAG_SHOW_UI,
+            )
+        }
     }
     DisposableEffect(key1 = state) { onDispose { state.cancelPendingReset() } }
     return state
@@ -65,6 +76,8 @@ internal class PlayerKeyInputState(
     private val seekIncrementMs: Long,
     private val coroutineScope: CoroutineScope,
     private val context: Context,
+    private val dpadUpDown: Int? = null,
+    private val adjustVolume: (Boolean) -> Unit = {},
 ) {
     var isSeeking: Boolean by mutableStateOf(value = false)
         private set
@@ -196,10 +209,19 @@ internal class PlayerKeyInputState(
 
             Key.DirectionUp, Key.DirectionDown -> {
                 if (!controls.controlsVisible) {
-                    // TV 全屏：上下键按 0.1 步进调倍速。控制栏隐藏时才生效，
-                    // 控制栏可见时仍交还焦点系统（否则无法在控制栏里上下切换按钮）。
                     val delta = if (keyEvent.key == Key.DirectionUp) SPEED_STEP else -SPEED_STEP
-                    changeSpeedBy(delta)
+                    when (dpadUpDown) {
+                        // 0 = 调系统音量；1 = 切上一个/下一个媒体项；2 = 调倍速。
+                        // 未配置（null）或其它值默认走调倍速，保持本 fork 原有 TV 行为。
+                        0 -> adjustVolume(keyEvent.key == Key.DirectionUp)
+                        1 -> if (keyEvent.key == Key.DirectionUp) {
+                            player.seekToNextMediaItem()
+                        } else {
+                            player.seekToPreviousMediaItem()
+                        }
+
+                        else -> changeSpeedBy(delta)
+                    }
                     true
                 } else {
                     controls.showControls()
